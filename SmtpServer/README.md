@@ -1,17 +1,42 @@
 # Achim SMTP Server
 
-Ein vollständiger SMTP-Server in C# .NET 10 mit StartTLS, DKIM-Verifizierung und DNS-Validierung.
+Ein vollständiger SMTP-Server in C# .NET 10 mit StartTLS, SMTP-AUTH, DKIM-Verifizierung und DNS-Validierung.
 
 ## Features
 
 - **SMTP-Protokoll**: Vollständige Implementierung nach RFC 5321
 - **STARTTLS**: TLS 1.2 und TLS 1.3 Unterstützung
+- **SMTP-AUTH**: PLAIN, LOGIN, SCRAM-SHA-256, EXTERNAL (mTLS)
 - **DKIM-Verifizierung**: Überprüfung von DKIM-Signaturen
 - **SPF-Validierung**: Sender Policy Framework Prüfung
 - **DMARC-Analyse**: Domain-based Message Authentication
 - **MX-Record-Abfrage**: Überprüfung der Sender-DNS-Konfiguration
 - **Dateispeicherung**: E-Mails werden als .eml-Dateien gespeichert
 - **Keine externen Abhängigkeiten**: Pure .NET-Implementierung
+
+## Authentifizierungsmechanismen
+
+| Mechanismus | Sicherheit | TLS erforderlich | Beschreibung |
+|-------------|------------|------------------|--------------|
+| **PLAIN** | Basis | ✓ Ja | Base64-kodiertes Passwort |
+| **LOGIN** | Basis | ✓ Ja | Zwei-Schritt Base64 (veraltet) |
+| **SCRAM-SHA-256** | Hoch | ✗ Nein | Challenge-Response, kein Passwort übertragen |
+| **EXTERNAL** | Sehr hoch | ✓ Ja (mTLS) | Client-Zertifikat-Authentifizierung |
+
+### SCRAM-SHA-256 Vorteile
+
+- Passwort wird **nie** übertragen (auch nicht als Hash)
+- Server speichert nur `StoredKey` und `ServerKey`
+- Mutual Authentication (Server beweist auch seine Identität)
+- Replay-Angriffe durch Nonces verhindert
+- Sicher auch ohne TLS (aber TLS empfohlen)
+
+### EXTERNAL (mTLS) Vorteile
+
+- Kein Passwort nötig
+- Zertifikat-basierte Authentifizierung
+- Ideal für Server-zu-Server-Kommunikation
+- Integration mit PKI-Infrastruktur
 
 ## Voraussetzungen
 
@@ -40,6 +65,22 @@ Der Server kann über Umgebungsvariablen konfiguriert werden:
 | `SMTP_SUBMISSION_PORT` | `2587` | Submission-Port |
 | `SMTP_MAIL_PATH` | `./mailstore` | Speicherort für E-Mails |
 
+## Benutzer-Verwaltung
+
+Benutzer werden in `mailstore/users.txt` gespeichert:
+
+```
+# Format: username:password_sha256:scram_salt:scram_stored_key:scram_server_key:iterations:cert_thumbprints
+
+admin:a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3:SALT:STOREDKEY:SERVERKEY:4096:
+certuser:::::::AABBCCDD11223344
+```
+
+Beim ersten Start werden automatisch Testbenutzer angelegt:
+- `admin` / `test123`
+- `user` / `test123`  
+- `demo` / `demo`
+
 ## Architektur
 
 ```
@@ -52,7 +93,12 @@ Der Server kann über Umgebungsvariablen konfiguriert werden:
 │  SmtpSession ──────────────────────────────────────────────────┤
 │       │                                                         │
 │       ├──► HELO/EHLO                                           │
-│       ├──► STARTTLS ──► SslStream                              │
+│       ├──► STARTTLS ──► SslStream ──► Client Certificate       │
+│       ├──► AUTH ─────► SmtpAuthManager                         │
+│       │                    ├──► PlainAuthHandler               │
+│       │                    ├──► LoginAuthHandler               │
+│       │                    ├──► ScramSha256AuthHandler         │
+│       │                    └──► ExternalAuthHandler            │
 │       ├──► MAIL FROM                                           │
 │       ├──► RCPT TO                                             │
 │       └──► DATA ──► EmailMessage.Parse()                       │
@@ -60,18 +106,11 @@ Der Server kann über Umgebungsvariablen konfiguriert werden:
 │                         ▼                                       │
 │              ┌─────────────────────┐                           │
 │              │   DnsVerifier       │                           │
-│              ├─────────────────────┤                           │
-│              │ • VerifySpfAsync()  │                           │
-│              │ • VerifyDkimAsync() │                           │
-│              │ • VerifyDmarcAsync()│                           │
-│              │ • GetMxRecordsAsync()│                          │
 │              └─────────────────────┘                           │
 │                         │                                       │
 │                         ▼                                       │
 │              ┌─────────────────────┐                           │
 │              │   FileMailStorage   │                           │
-│              │   → ./mailstore/    │                           │
-│              │   → .eml files      │                           │
 │              └─────────────────────┘                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -83,13 +122,67 @@ Der Server kann über Umgebungsvariablen konfiguriert werden:
 | `HELO` | Einfache Begrüßung |
 | `EHLO` | Extended HELO mit Capabilities |
 | `STARTTLS` | TLS-Verbindung initiieren |
+| `AUTH` | Authentifizierung starten |
 | `MAIL FROM:` | Absender angeben |
 | `RCPT TO:` | Empfänger angeben |
 | `DATA` | Nachrichteninhalt senden |
 | `RSET` | Transaktion zurücksetzen |
 | `NOOP` | Keine Operation |
 | `QUIT` | Verbindung beenden |
-| `VRFY` | Adresse verifizieren (deaktiviert) |
+
+## AUTH Beispiele
+
+### AUTH PLAIN
+
+```
+C: AUTH PLAIN AGFkbWluAHRlc3QxMjM=
+S: 235 2.7.0 Authentication successful
+```
+
+Der Base64-String enthält: `\0admin\0test123`
+
+### AUTH LOGIN
+
+```
+C: AUTH LOGIN
+S: 334 VXNlcm5hbWU6
+C: YWRtaW4=
+S: 334 UGFzc3dvcmQ6
+C: dGVzdDEyMw==
+S: 235 2.7.0 Authentication successful
+```
+
+### AUTH SCRAM-SHA-256
+
+```
+C: AUTH SCRAM-SHA-256 biwsbj1hZG1pbixyPWNsaWVudE5vbmNl
+S: 334 cj1jbGllbnROb25jZXNlcnZlck5vbmNlLHM9c2FsdCxpPTQwOTY=
+C: Yz1iaXdzLHI9Y2xpZW50Tm9uY2VzZXJ2ZXJOb25jZSxwPVByb29m
+S: 235 2.7.0 Authentication successful dj1TZXJ2ZXJTaWduYXR1cmU=
+```
+
+### AUTH EXTERNAL (mit Client-Zertifikat)
+
+```
+C: AUTH EXTERNAL
+S: 235 2.7.0 Authentication successful
+```
+
+## Client-Zertifikat für EXTERNAL
+
+```bash
+# Client-Zertifikat erstellen
+openssl req -x509 -newkey rsa:2048 -keyout client.key -out client.crt \
+    -days 365 -nodes -subj "/CN=admin"
+
+# Als PKCS#12 exportieren
+openssl pkcs12 -export -out client.pfx -inkey client.key -in client.crt
+
+# Thumbprint anzeigen
+openssl x509 -in client.crt -fingerprint -sha1 -noout
+```
+
+Dann den Thumbprint in `users.txt` eintragen.
 
 ## E-Mail-Speicherformat
 
@@ -102,81 +195,12 @@ X-Received-At: 2024-12-23T10:00:00.000Z
 X-SPF-Result: Pass
 X-DKIM-Result: Pass
 X-DMARC-Result: Pass
-X-MX-Records: mail.example.com, mail2.example.com
+X-MX-Records: mail.example.com
 
 From: sender@example.com
 To: recipient@localhost
 Subject: Test
 ...
-```
-
-## DNS-Verifizierung
-
-### SPF (Sender Policy Framework)
-
-Der Server überprüft:
-- `ip4:` und `ip6:` Mechanismen
-- `a:` und `mx:` Lookups
-- `include:` rekursive Abfragen
-- `all` Qualifier (+, -, ~, ?)
-
-### DKIM (DomainKeys Identified Mail)
-
-Verifiziert:
-- Body-Hash (`bh=`)
-- Header-Signatur (`b=`)
-- Canonicalization (simple/relaxed)
-- Öffentlicher Schlüssel aus DNS
-
-### DMARC
-
-Prüft:
-- `_dmarc.domain.com` TXT-Record
-- Policy-Extraktion (none, quarantine, reject)
-- Organizational Domain Fallback
-
-## TLS-Konfiguration
-
-### Selbstsigniertes Zertifikat (automatisch)
-
-Beim ersten Start wird automatisch ein selbstsigniertes Zertifikat erstellt.
-
-### Eigenes Zertifikat
-
-```csharp
-var config = new SmtpServerConfig
-{
-    CertificatePath = "/path/to/certificate.pfx",
-    CertificatePassword = "your-password",
-    RequireStartTls = true  // TLS erforderlich
-};
-```
-
-### Let's Encrypt
-
-```bash
-# Zertifikat konvertieren
-openssl pkcs12 -export -out server.pfx \
-    -inkey privkey.pem -in fullchain.pem
-```
-
-## Beispiel: E-Mail senden
-
-```bash
-# Mit telnet testen
-telnet localhost 2525
-
-EHLO myclient
-MAIL FROM:<me@example.com>
-RCPT TO:<you@localhost>
-DATA
-From: me@example.com
-To: you@localhost
-Subject: Test
-
-Hello World!
-.
-QUIT
 ```
 
 ## Sicherheitshinweise
@@ -186,16 +210,16 @@ QUIT
 1. **Ports**: Verwende die Standardports 25 und 587 (erfordert Root/Admin)
 2. **TLS**: Aktiviere `RequireStartTls = true` für Produktion
 3. **Zertifikat**: Verwende ein gültiges Zertifikat (Let's Encrypt)
-4. **Firewall**: Beschränke Zugriff auf vertrauenswürdige IPs
-5. **Rate Limiting**: Implementiere zusätzliche Schutzmaßnahmen
+4. **AUTH**: SCRAM-SHA-256 oder EXTERNAL bevorzugen
+5. **Firewall**: Beschränke Zugriff auf vertrauenswürdige IPs
 
 ## Erweiterungsmöglichkeiten
 
 - [ ] DMARC-Alignment-Prüfung
 - [ ] ARC (Authenticated Received Chain)
 - [ ] Greylisting
-- [ ] Spam-Filterung (SpamAssassin-Integration)
-- [ ] SMTP-AUTH (PLAIN, LOGIN, CRAM-MD5)
+- [ ] XOAUTH2 / OAUTHBEARER
+- [ ] SMTP-Relay mit AUTH
 - [ ] Maildir-Format
 - [ ] Queue-System für Retry
 - [ ] Prometheus-Metriken
