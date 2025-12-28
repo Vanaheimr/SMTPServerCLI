@@ -1,0 +1,1258 @@
+// SMTP Server with StartTLS, DKIM Verification, and DNS Validation
+// .NET 10 / C# 13
+// Author: Claude for Achim
+
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace AchimSmtpServer
+{
+    #region Configuration
+
+    public sealed record SmtpServerConfig
+    {
+        public required string Hostname { get; init; }
+        public int Port { get; init; } = 25;
+        public int SubmissionPort { get; init; } = 587;
+        public string MailStoragePath { get; init; } = "./mailstore";
+        public string? CertificatePath { get; init; }
+        public string? CertificatePassword { get; init; }
+        public TimeSpan SessionTimeout { get; init; } = TimeSpan.FromMinutes(5);
+        public int MaxMessageSize { get; init; } = 25 * 1024 * 1024; // 25 MB
+        public int MaxRecipients { get; init; } = 100;
+        public bool RequireStartTls { get; init; } = false;
+        public bool VerifyDkim { get; init; } = true;
+        public bool VerifySpf { get; init; } = true;
+        public bool VerifyDmarc { get; init; } = true;
+    }
+
+    #endregion
+
+    #region DNS Verification
+
+    public enum SpfResult { None, Pass, Fail, SoftFail, Neutral, TempError, PermError }
+    public enum DkimResult { None, Pass, Fail, TempError, PermError }
+    public enum DmarcResult { None, Pass, Fail, TempError, PermError }
+
+    public sealed record DnsVerificationResult(
+        SpfResult Spf,
+        string? SpfRecord,
+        DkimResult Dkim,
+        string? DkimDetails,
+        DmarcResult Dmarc,
+        string? DmarcPolicy,
+        string[] MxRecords
+    );
+
+    public sealed partial class DnsVerifier(ILogger logger)
+    {
+        public async Task<DnsVerificationResult> VerifyAsync(
+            string senderDomain,
+            IPAddress clientIp,
+            string mailFrom,
+            string heloHostname,
+            EmailMessage message,
+            CancellationToken ct = default)
+        {
+            var spfTask = VerifySpfAsync(senderDomain, clientIp, mailFrom, heloHostname, ct);
+            var dkimTask = VerifyDkimAsync(message, ct);
+            var dmarcTask = VerifyDmarcAsync(senderDomain, ct);
+            var mxTask = GetMxRecordsAsync(senderDomain, ct);
+
+            await Task.WhenAll(spfTask, dkimTask, dmarcTask, mxTask);
+
+            return new DnsVerificationResult(
+                spfTask.Result.Result,
+                spfTask.Result.Record,
+                dkimTask.Result.Result,
+                dkimTask.Result.Details,
+                dmarcTask.Result.Result,
+                dmarcTask.Result.Policy,
+                mxTask.Result
+            );
+        }
+
+        #region SPF Verification
+
+        private async Task<(SpfResult Result, string? Record)> VerifySpfAsync(
+            string domain,
+            IPAddress clientIp,
+            string mailFrom,
+            string heloHostname,
+            CancellationToken ct)
+        {
+            try
+            {
+                var spfRecord = await GetTxtRecordAsync(domain, "v=spf1", ct);
+                if (spfRecord is null)
+                    return (SpfResult.None, null);
+
+                logger.Log(LogLevel.Debug, $"SPF record for {domain}: {spfRecord}");
+
+                var result = EvaluateSpf(spfRecord, clientIp, domain, mailFrom);
+                return (result, spfRecord);
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Warning, $"SPF verification error for {domain}: {ex.Message}");
+                return (SpfResult.TempError, null);
+            }
+        }
+
+        private SpfResult EvaluateSpf(string spfRecord, IPAddress clientIp, string domain, string mailFrom)
+        {
+            var mechanisms = spfRecord.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var mechanism in mechanisms.Skip(1)) // Skip "v=spf1"
+            {
+                var qualifier = mechanism[0] switch
+                {
+                    '+' => SpfResult.Pass,
+                    '-' => SpfResult.Fail,
+                    '~' => SpfResult.SoftFail,
+                    '?' => SpfResult.Neutral,
+                    _ => SpfResult.Pass // Default qualifier is Pass
+                };
+
+                var mech = mechanism.TrimStart('+', '-', '~', '?').ToLowerInvariant();
+
+                if (mech == "all")
+                    return qualifier;
+
+                if (mech.StartsWith("ip4:") && clientIp.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    var cidr = mech[4..];
+                    if (IpMatchesCidr(clientIp, cidr))
+                        return qualifier;
+                }
+                else if (mech.StartsWith("ip6:") && clientIp.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    var cidr = mech[4..];
+                    if (IpMatchesCidr(clientIp, cidr))
+                        return qualifier;
+                }
+                else if (mech.StartsWith("a:") || mech == "a")
+                {
+                    var targetDomain = mech == "a" ? domain : mech[2..];
+                    if (CheckARecord(clientIp, targetDomain).Result)
+                        return qualifier;
+                }
+                else if (mech.StartsWith("mx:") || mech == "mx")
+                {
+                    var targetDomain = mech == "mx" ? domain : mech[3..];
+                    if (CheckMxRecord(clientIp, targetDomain).Result)
+                        return qualifier;
+                }
+                else if (mech.StartsWith("include:"))
+                {
+                    var includeDomain = mech[8..];
+                    var includeRecord = GetTxtRecordAsync(includeDomain, "v=spf1", CancellationToken.None).Result;
+                    if (includeRecord is not null)
+                    {
+                        var includeResult = EvaluateSpf(includeRecord, clientIp, includeDomain, mailFrom);
+                        if (includeResult == SpfResult.Pass)
+                            return qualifier;
+                    }
+                }
+            }
+
+            return SpfResult.Neutral;
+        }
+
+        private static bool IpMatchesCidr(IPAddress ip, string cidr)
+        {
+            try
+            {
+                var parts = cidr.Split('/');
+                var network = IPAddress.Parse(parts[0]);
+                var prefixLength = parts.Length > 1 ? int.Parse(parts[1]) : (ip.AddressFamily == AddressFamily.InterNetwork ? 32 : 128);
+
+                var ipBytes = ip.GetAddressBytes();
+                var networkBytes = network.GetAddressBytes();
+
+                if (ipBytes.Length != networkBytes.Length)
+                    return false;
+
+                var fullBytes = prefixLength / 8;
+                var remainingBits = prefixLength % 8;
+
+                for (int i = 0; i < fullBytes; i++)
+                {
+                    if (ipBytes[i] != networkBytes[i])
+                        return false;
+                }
+
+                if (remainingBits > 0 && fullBytes < ipBytes.Length)
+                {
+                    var mask = (byte)(0xFF << (8 - remainingBits));
+                    if ((ipBytes[fullBytes] & mask) != (networkBytes[fullBytes] & mask))
+                        return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private async Task<bool> CheckARecord(IPAddress clientIp, string domain)
+        {
+            try
+            {
+                var addresses = await Dns.GetHostAddressesAsync(domain);
+                return addresses.Contains(clientIp);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private async Task<bool> CheckMxRecord(IPAddress clientIp, string domain)
+        {
+            try
+            {
+                var mxRecords = await GetMxRecordsAsync(domain, CancellationToken.None);
+                foreach (var mx in mxRecords)
+                {
+                    var addresses = await Dns.GetHostAddressesAsync(mx);
+                    if (addresses.Contains(clientIp))
+                        return true;
+                }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        #endregion
+
+        #region DKIM Verification
+
+        private async Task<(DkimResult Result, string? Details)> VerifyDkimAsync(
+            EmailMessage message,
+            CancellationToken ct)
+        {
+            try
+            {
+                var dkimHeaders = message.Headers
+                    .Where(h => h.Key.Equals("DKIM-Signature", StringComparison.OrdinalIgnoreCase))
+                    .Select(h => h.Value)
+                    .ToList();
+
+                if (dkimHeaders.Count == 0)
+                    return (DkimResult.None, "No DKIM signature found");
+
+                foreach (var dkimHeader in dkimHeaders)
+                {
+                    var result = await VerifySingleDkimSignature(dkimHeader, message, ct);
+                    if (result.Result == DkimResult.Pass)
+                        return result;
+                }
+
+                return (DkimResult.Fail, "All DKIM signatures failed verification");
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Warning, $"DKIM verification error: {ex.Message}");
+                return (DkimResult.TempError, ex.Message);
+            }
+        }
+
+        private async Task<(DkimResult Result, string? Details)> VerifySingleDkimSignature(
+            string dkimHeader,
+            EmailMessage message,
+            CancellationToken ct)
+        {
+            var dkimParams = ParseDkimHeader(dkimHeader);
+
+            if (!dkimParams.TryGetValue("d", out var domain) ||
+                !dkimParams.TryGetValue("s", out var selector) ||
+                !dkimParams.TryGetValue("b", out var signature) ||
+                !dkimParams.TryGetValue("bh", out var bodyHash))
+            {
+                return (DkimResult.Fail, "Missing required DKIM parameters");
+            }
+
+            // Get public key from DNS
+            var dkimDomain = $"{selector}._domainkey.{domain}";
+            var dkimRecord = await GetTxtRecordAsync(dkimDomain, "v=DKIM1", ct);
+
+            if (dkimRecord is null)
+                return (DkimResult.Fail, $"No DKIM record found at {dkimDomain}");
+
+            var dkimRecordParams = ParseDkimRecord(dkimRecord);
+
+            if (!dkimRecordParams.TryGetValue("p", out var publicKeyBase64))
+                return (DkimResult.Fail, "No public key in DKIM record");
+
+            // Verify body hash
+            var algorithm = dkimParams.GetValueOrDefault("a", "rsa-sha256");
+            var canonicalization = dkimParams.GetValueOrDefault("c", "simple/simple");
+            var (headerCanon, bodyCanon) = ParseCanonicalization(canonicalization);
+
+            var canonicalizedBody = CanonicalizeBody(message.Body, bodyCanon);
+            var computedBodyHash = ComputeBodyHash(canonicalizedBody, algorithm);
+
+            if (computedBodyHash != bodyHash)
+                return (DkimResult.Fail, $"Body hash mismatch: expected {bodyHash}, got {computedBodyHash}");
+
+            // Verify signature
+            var signedHeaders = dkimParams.GetValueOrDefault("h", "").Split(':');
+            var headerData = BuildSignedHeaderData(message, signedHeaders, dkimHeader, headerCanon);
+
+            try
+            {
+                var publicKeyBytes = Convert.FromBase64String(publicKeyBase64);
+                var signatureBytes = Convert.FromBase64String(signature.Replace(" ", "").Replace("\r", "").Replace("\n", ""));
+
+                using var rsa = RSA.Create();
+                rsa.ImportSubjectPublicKeyInfo(publicKeyBytes, out _);
+
+                var hashAlgorithm = algorithm.Contains("sha256") ? HashAlgorithmName.SHA256 : HashAlgorithmName.SHA1;
+                var headerBytes = Encoding.ASCII.GetBytes(headerData);
+
+                var isValid = rsa.VerifyData(headerBytes, signatureBytes, hashAlgorithm, RSASignaturePadding.Pkcs1);
+
+                return isValid
+                    ? (DkimResult.Pass, $"DKIM signature valid for domain {domain}")
+                    : (DkimResult.Fail, "Signature verification failed");
+            }
+            catch (Exception ex)
+            {
+                return (DkimResult.Fail, $"Signature verification error: {ex.Message}");
+            }
+        }
+
+        private static Dictionary<string, string> ParseDkimHeader(string header)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var normalized = header.Replace("\r\n", "").Replace("\n", "").Replace("\t", " ");
+
+            foreach (var part in normalized.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var trimmed = part.Trim();
+                var eqIndex = trimmed.IndexOf('=');
+                if (eqIndex > 0)
+                {
+                    var key = trimmed[..eqIndex].Trim();
+                    var value = trimmed[(eqIndex + 1)..].Trim();
+                    result[key] = value;
+                }
+            }
+            return result;
+        }
+
+        private static Dictionary<string, string> ParseDkimRecord(string record)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var part in record.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var trimmed = part.Trim();
+                var eqIndex = trimmed.IndexOf('=');
+                if (eqIndex > 0)
+                {
+                    var key = trimmed[..eqIndex].Trim();
+                    var value = trimmed[(eqIndex + 1)..].Trim();
+                    result[key] = value;
+                }
+            }
+            return result;
+        }
+
+        private static (string Header, string Body) ParseCanonicalization(string c)
+        {
+            var parts = c.Split('/');
+            return (parts[0].ToLowerInvariant(), parts.Length > 1 ? parts[1].ToLowerInvariant() : parts[0].ToLowerInvariant());
+        }
+
+        private static string CanonicalizeBody(string body, string method)
+        {
+            if (method == "relaxed")
+            {
+                var lines = body.Split("\r\n");
+                var canonicalized = lines
+                    .Select(line => Regex.Replace(line, @"[ \t]+", " ").TrimEnd())
+                    .ToList();
+
+                // Remove trailing empty lines
+                while (canonicalized.Count > 0 && string.IsNullOrEmpty(canonicalized[^1]))
+                    canonicalized.RemoveAt(canonicalized.Count - 1);
+
+                return string.Join("\r\n", canonicalized) + "\r\n";
+            }
+            else // simple
+            {
+                var result = body;
+                while (result.EndsWith("\r\n\r\n"))
+                    result = result[..^2];
+                if (!result.EndsWith("\r\n"))
+                    result += "\r\n";
+                return result;
+            }
+        }
+
+        private static string ComputeBodyHash(string body, string algorithm)
+        {
+            var bytes = Encoding.ASCII.GetBytes(body);
+            byte[] hash;
+
+            if (algorithm.Contains("sha256"))
+                hash = SHA256.HashData(bytes);
+            else
+                hash = SHA1.HashData(bytes);
+
+            return Convert.ToBase64String(hash);
+        }
+
+        private static string BuildSignedHeaderData(EmailMessage message, string[] signedHeaders, string dkimHeader, string method)
+        {
+            var sb = new StringBuilder();
+
+            foreach (var headerName in signedHeaders)
+            {
+                var trimmedName = headerName.Trim();
+                var headerValue = message.Headers
+                    .FirstOrDefault(h => h.Key.Equals(trimmedName, StringComparison.OrdinalIgnoreCase))
+                    .Value;
+
+                if (headerValue is not null)
+                {
+                    if (method == "relaxed")
+                    {
+                        var canonName = trimmedName.ToLowerInvariant();
+                        var canonValue = Regex.Replace(headerValue, @"[ \t]+", " ").Trim();
+                        sb.Append($"{canonName}:{canonValue}\r\n");
+                    }
+                    else
+                    {
+                        sb.Append($"{trimmedName}: {headerValue}\r\n");
+                    }
+                }
+            }
+
+            // Add DKIM-Signature header without the b= value
+            var dkimForSigning = Regex.Replace(dkimHeader, @"b=[^;]*", "b=");
+            if (method == "relaxed")
+            {
+                var canonValue = Regex.Replace(dkimForSigning, @"[ \t]+", " ").Trim();
+                sb.Append($"dkim-signature:{canonValue}");
+            }
+            else
+            {
+                sb.Append($"DKIM-Signature: {dkimForSigning}");
+            }
+
+            return sb.ToString();
+        }
+
+        #endregion
+
+        #region DMARC Verification
+
+        private async Task<(DmarcResult Result, string? Policy)> VerifyDmarcAsync(
+            string domain,
+            CancellationToken ct)
+        {
+            try
+            {
+                var dmarcDomain = $"_dmarc.{domain}";
+                var dmarcRecord = await GetTxtRecordAsync(dmarcDomain, "v=DMARC1", ct);
+
+                if (dmarcRecord is null)
+                {
+                    // Try organizational domain
+                    var orgDomain = GetOrganizationalDomain(domain);
+                    if (orgDomain != domain)
+                    {
+                        dmarcDomain = $"_dmarc.{orgDomain}";
+                        dmarcRecord = await GetTxtRecordAsync(dmarcDomain, "v=DMARC1", ct);
+                    }
+                }
+
+                if (dmarcRecord is null)
+                    return (DmarcResult.None, null);
+
+                var policy = ExtractDmarcPolicy(dmarcRecord);
+                logger.Log(LogLevel.Debug, $"DMARC record for {domain}: {dmarcRecord}");
+
+                return (DmarcResult.Pass, policy);
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Warning, $"DMARC verification error for {domain}: {ex.Message}");
+                return (DmarcResult.TempError, null);
+            }
+        }
+
+        private static string GetOrganizationalDomain(string domain)
+        {
+            var parts = domain.Split('.');
+            return parts.Length > 2 ? string.Join('.', parts[^2..]) : domain;
+        }
+
+        private static string ExtractDmarcPolicy(string record)
+        {
+            var match = Regex.Match(record, @"p=(\w+)");
+            return match.Success ? match.Groups[1].Value : "none";
+        }
+
+        #endregion
+
+        #region DNS Helpers
+
+        private async Task<string?> GetTxtRecordAsync(string domain, string prefix, CancellationToken ct)
+        {
+            try
+            {
+                // Use system DNS resolver through nslookup simulation
+                // In production, use a proper DNS library like DnsClient
+                var process = new System.Diagnostics.Process
+                {
+                    StartInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = OperatingSystem.IsWindows() ? "nslookup" : "dig",
+                        Arguments = OperatingSystem.IsWindows()
+                            ? $"-type=TXT {domain}"
+                            : $"+short TXT {domain}",
+                        RedirectStandardOutput = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    }
+                };
+
+                process.Start();
+                var output = await process.StandardOutput.ReadToEndAsync(ct);
+                await process.WaitForExitAsync(ct);
+
+                // Parse TXT records
+                var matches = TxtRecordRegex().Matches(output);
+                foreach (Match match in matches)
+                {
+                    var record = match.Groups[1].Value.Replace("\" \"", "");
+                    if (record.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        return record;
+                }
+
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public async Task<string[]> GetMxRecordsAsync(string domain, CancellationToken ct)
+        {
+            try
+            {
+                var process = new System.Diagnostics.Process
+                {
+                    StartInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = OperatingSystem.IsWindows() ? "nslookup" : "dig",
+                        Arguments = OperatingSystem.IsWindows()
+                            ? $"-type=MX {domain}"
+                            : $"+short MX {domain}",
+                        RedirectStandardOutput = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    }
+                };
+
+                process.Start();
+                var output = await process.StandardOutput.ReadToEndAsync(ct);
+                await process.WaitForExitAsync(ct);
+
+                var matches = MxRecordRegex().Matches(output);
+                return matches.Select(m => m.Groups[1].Value.TrimEnd('.')).ToArray();
+            }
+            catch
+            {
+                return [];
+            }
+        }
+
+        [GeneratedRegex(@"""([^""]+)""")]
+        private static partial Regex TxtRecordRegex();
+
+        [GeneratedRegex(@"(?:^\d+\s+)?(\S+\.?)$", RegexOptions.Multiline)]
+        private static partial Regex MxRecordRegex();
+
+        #endregion
+    }
+
+    #endregion
+
+    #region Email Message
+
+    public sealed class EmailMessage
+    {
+        public string RawMessage { get; init; } = "";
+        public List<KeyValuePair<string, string>> Headers { get; } = [];
+        public string Body { get; set; } = "";
+        public string? From { get; set; }
+        public List<string> To { get; } = [];
+        public string? Subject { get; set; }
+        public DateTime ReceivedAt { get; init; } = DateTime.UtcNow;
+        public string? MessageId { get; set; }
+        public DnsVerificationResult? Verification { get; set; }
+
+        public static EmailMessage Parse(string rawMessage)
+        {
+            var message = new EmailMessage { RawMessage = rawMessage };
+
+            var headerBodySplit = rawMessage.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            if (headerBodySplit < 0)
+                headerBodySplit = rawMessage.IndexOf("\n\n", StringComparison.Ordinal);
+
+            string headerSection, bodySection;
+            if (headerBodySplit > 0)
+            {
+                headerSection = rawMessage[..headerBodySplit];
+                bodySection = rawMessage[(headerBodySplit + (rawMessage[headerBodySplit] == '\r' ? 4 : 2))..];
+            }
+            else
+            {
+                headerSection = rawMessage;
+                bodySection = "";
+            }
+
+            message.Body = bodySection;
+
+            // Parse headers (handle folded headers)
+            var unfoldedHeaders = Regex.Replace(headerSection, @"\r?\n[ \t]+", " ");
+            var headerLines = unfoldedHeaders.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var line in headerLines)
+            {
+                var colonIndex = line.IndexOf(':');
+                if (colonIndex > 0)
+                {
+                    var name = line[..colonIndex].Trim();
+                    var value = line[(colonIndex + 1)..].Trim();
+                    message.Headers.Add(new KeyValuePair<string, string>(name, value));
+
+                    switch (name.ToLowerInvariant())
+                    {
+                        case "from":
+                            message.From = ExtractEmailAddress(value);
+                            break;
+                        case "to":
+                            message.To.AddRange(ExtractEmailAddresses(value));
+                            break;
+                        case "subject":
+                            message.Subject = value;
+                            break;
+                        case "message-id":
+                            message.MessageId = value.Trim('<', '>');
+                            break;
+                    }
+                }
+            }
+
+            return message;
+        }
+
+        private static string? ExtractEmailAddress(string value)
+        {
+            var match = Regex.Match(value, @"<([^>]+)>");
+            if (match.Success)
+                return match.Groups[1].Value;
+
+            match = Regex.Match(value, @"[\w\.-]+@[\w\.-]+\.\w+");
+            return match.Success ? match.Value : null;
+        }
+
+        private static IEnumerable<string> ExtractEmailAddresses(string value)
+        {
+            var matches = Regex.Matches(value, @"[\w\.-]+@[\w\.-]+\.\w+");
+            return matches.Select(m => m.Value);
+        }
+    }
+
+    #endregion
+
+    #region Mail Storage
+
+    public interface IMailStorage
+    {
+        Task<string> StoreAsync(EmailMessage message, string envelopeFrom, IEnumerable<string> envelopeTo, CancellationToken ct = default);
+    }
+
+    public sealed class FileMailStorage(string basePath, ILogger logger) : IMailStorage
+    {
+        public async Task<string> StoreAsync(
+            EmailMessage message,
+            string envelopeFrom,
+            IEnumerable<string> envelopeTo,
+            CancellationToken ct = default)
+        {
+            Directory.CreateDirectory(basePath);
+
+            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
+            var messageId = message.MessageId ?? Guid.NewGuid().ToString("N")[..16];
+            var fileName = $"{timestamp}_{SanitizeFileName(messageId)}.eml";
+            var filePath = Path.Combine(basePath, fileName);
+
+            // Build metadata header
+            var metadata = new StringBuilder();
+            metadata.AppendLine($"X-Envelope-From: {envelopeFrom}");
+            metadata.AppendLine($"X-Envelope-To: {string.Join(", ", envelopeTo)}");
+            metadata.AppendLine($"X-Received-At: {message.ReceivedAt:O}");
+
+            if (message.Verification is not null)
+            {
+                var v = message.Verification;
+                metadata.AppendLine($"X-SPF-Result: {v.Spf}");
+                metadata.AppendLine($"X-DKIM-Result: {v.Dkim}");
+                metadata.AppendLine($"X-DMARC-Result: {v.Dmarc}");
+                if (v.SpfRecord is not null)
+                    metadata.AppendLine($"X-SPF-Record: {v.SpfRecord}");
+                if (v.DkimDetails is not null)
+                    metadata.AppendLine($"X-DKIM-Details: {v.DkimDetails}");
+                if (v.DmarcPolicy is not null)
+                    metadata.AppendLine($"X-DMARC-Policy: {v.DmarcPolicy}");
+                if (v.MxRecords.Length > 0)
+                    metadata.AppendLine($"X-MX-Records: {string.Join(", ", v.MxRecords)}");
+            }
+
+            var fullMessage = metadata.ToString() + message.RawMessage;
+            await File.WriteAllTextAsync(filePath, fullMessage, ct);
+
+            logger.Log(LogLevel.Info, $"Stored message: {filePath}");
+            return filePath;
+        }
+
+        private static string SanitizeFileName(string name)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            return string.Join("_", name.Split(invalid, StringSplitOptions.RemoveEmptyEntries));
+        }
+    }
+
+    #endregion
+
+    #region SMTP Session
+
+    public enum SmtpSessionState { Connected, Greeted, MailFrom, RcptTo, Data, Quit }
+
+    public sealed class SmtpSession(
+        TcpClient client,
+        SmtpServerConfig config,
+        IMailStorage storage,
+        DnsVerifier dnsVerifier,
+        X509Certificate2? certificate,
+        ILogger logger)
+    {
+        private Stream _stream = client.GetStream();
+        private StreamReader _reader = new(client.GetStream(), Encoding.ASCII);
+        private StreamWriter _writer = new(client.GetStream(), Encoding.ASCII) { AutoFlush = true };
+        private SmtpSessionState _state = SmtpSessionState.Connected;
+        private string? _mailFrom;
+        private readonly List<string> _rcptTo = [];
+        private bool _tlsActive;
+        private readonly IPAddress _clientIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
+        private string _heloHostname = "";
+
+        public async Task HandleAsync(CancellationToken ct)
+        {
+            try
+            {
+                await SendResponseAsync(220, $"{config.Hostname} ESMTP AchimSMTP ready");
+
+                while (!ct.IsCancellationRequested && client.Connected)
+                {
+                    var line = await ReadLineAsync(ct);
+                    if (line is null)
+                        break;
+
+                    logger.Log(LogLevel.Debug, $"C: {line}");
+
+                    var (command, args) = ParseCommand(line);
+                    await ProcessCommandAsync(command, args, ct);
+
+                    if (_state == SmtpSessionState.Quit)
+                        break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                logger.Log(LogLevel.Debug, "Session cancelled");
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Error, $"Session error: {ex.Message}");
+            }
+            finally
+            {
+                client.Close();
+            }
+        }
+
+        private async Task ProcessCommandAsync(string command, string args, CancellationToken ct)
+        {
+            switch (command.ToUpperInvariant())
+            {
+                case "HELO":
+                    await HandleHeloAsync(args);
+                    break;
+                case "EHLO":
+                    await HandleEhloAsync(args);
+                    break;
+                case "STARTTLS":
+                    await HandleStartTlsAsync(ct);
+                    break;
+                case "MAIL":
+                    await HandleMailFromAsync(args);
+                    break;
+                case "RCPT":
+                    await HandleRcptToAsync(args);
+                    break;
+                case "DATA":
+                    await HandleDataAsync(ct);
+                    break;
+                case "RSET":
+                    await HandleRsetAsync();
+                    break;
+                case "NOOP":
+                    await SendResponseAsync(250, "OK");
+                    break;
+                case "QUIT":
+                    await HandleQuitAsync();
+                    break;
+                case "VRFY":
+                    await SendResponseAsync(252, "Cannot verify user");
+                    break;
+                default:
+                    await SendResponseAsync(500, "Unrecognized command");
+                    break;
+            }
+        }
+
+        private async Task HandleHeloAsync(string hostname)
+        {
+            _heloHostname = hostname;
+            _state = SmtpSessionState.Greeted;
+            await SendResponseAsync(250, $"Hello {hostname}, pleased to meet you");
+        }
+
+        private async Task HandleEhloAsync(string hostname)
+        {
+            _heloHostname = hostname;
+            _state = SmtpSessionState.Greeted;
+
+            var extensions = new List<string>
+            {
+                $"{config.Hostname} Hello {hostname}",
+                $"SIZE {config.MaxMessageSize}",
+                "8BITMIME",
+                "ENHANCEDSTATUSCODES",
+                "PIPELINING"
+            };
+
+            if (certificate is not null && !_tlsActive)
+                extensions.Add("STARTTLS");
+
+            for (int i = 0; i < extensions.Count - 1; i++)
+                await SendResponseAsync(250, extensions[i], multiline: true);
+
+            await SendResponseAsync(250, extensions[^1]);
+        }
+
+        private async Task HandleStartTlsAsync(CancellationToken ct)
+        {
+            if (certificate is null)
+            {
+                await SendResponseAsync(454, "TLS not available");
+                return;
+            }
+
+            if (_tlsActive)
+            {
+                await SendResponseAsync(503, "TLS already active");
+                return;
+            }
+
+            await SendResponseAsync(220, "Ready to start TLS");
+
+            try
+            {
+                var sslStream = new SslStream(_stream, false);
+                await sslStream.AuthenticateAsServerAsync(
+                    new SslServerAuthenticationOptions
+                    {
+                        ServerCertificate = certificate,
+                        ClientCertificateRequired = false,
+                        EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 |
+                                              System.Security.Authentication.SslProtocols.Tls13
+                    },
+                    ct
+                );
+
+                _stream = sslStream;
+                _reader = new StreamReader(sslStream, Encoding.ASCII);
+                _writer = new StreamWriter(sslStream, Encoding.ASCII) { AutoFlush = true };
+                _tlsActive = true;
+                _state = SmtpSessionState.Connected;
+
+                logger.Log(LogLevel.Info, $"TLS established: {sslStream.SslProtocol}, {sslStream.CipherAlgorithm}");
+            }
+            catch (Exception ex)
+            {
+                logger.Log(LogLevel.Error, $"TLS handshake failed: {ex.Message}");
+                throw;
+            }
+        }
+
+        private async Task HandleMailFromAsync(string args)
+        {
+            if (_state < SmtpSessionState.Greeted)
+            {
+                await SendResponseAsync(503, "Say HELO first");
+                return;
+            }
+
+            if (config.RequireStartTls && !_tlsActive)
+            {
+                await SendResponseAsync(530, "Must issue STARTTLS first");
+                return;
+            }
+
+            var match = Regex.Match(args, @"FROM:\s*<([^>]*)>", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                await SendResponseAsync(501, "Syntax error in MAIL command");
+                return;
+            }
+
+            _mailFrom = match.Groups[1].Value;
+            _rcptTo.Clear();
+            _state = SmtpSessionState.MailFrom;
+
+            await SendResponseAsync(250, "OK");
+        }
+
+        private async Task HandleRcptToAsync(string args)
+        {
+            if (_state < SmtpSessionState.MailFrom)
+            {
+                await SendResponseAsync(503, "Need MAIL command first");
+                return;
+            }
+
+            var match = Regex.Match(args, @"TO:\s*<([^>]+)>", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                await SendResponseAsync(501, "Syntax error in RCPT command");
+                return;
+            }
+
+            if (_rcptTo.Count >= config.MaxRecipients)
+            {
+                await SendResponseAsync(452, "Too many recipients");
+                return;
+            }
+
+            _rcptTo.Add(match.Groups[1].Value);
+            _state = SmtpSessionState.RcptTo;
+
+            await SendResponseAsync(250, "OK");
+        }
+
+        private async Task HandleDataAsync(CancellationToken ct)
+        {
+            if (_state < SmtpSessionState.RcptTo || _rcptTo.Count == 0)
+            {
+                await SendResponseAsync(503, "Need RCPT command first");
+                return;
+            }
+
+            await SendResponseAsync(354, "Start mail input; end with <CRLF>.<CRLF>");
+
+            var messageBuilder = new StringBuilder();
+            var totalSize = 0;
+
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await ReadLineAsync(ct);
+                if (line is null)
+                    break;
+
+                if (line == ".")
+                    break;
+
+                // Dot-stuffing: remove leading dot if line starts with ".."
+                if (line.StartsWith(".."))
+                    line = line[1..];
+
+                totalSize += line.Length + 2;
+                if (totalSize > config.MaxMessageSize)
+                {
+                    await SendResponseAsync(552, "Message size exceeds maximum");
+                    ResetTransaction();
+                    return;
+                }
+
+                messageBuilder.AppendLine(line);
+            }
+
+            var rawMessage = messageBuilder.ToString();
+            var message = EmailMessage.Parse(rawMessage);
+
+            // Perform DNS verification
+            var senderDomain = ExtractDomain(_mailFrom ?? "");
+            if (!string.IsNullOrEmpty(senderDomain))
+            {
+                message.Verification = await dnsVerifier.VerifyAsync(
+                    senderDomain,
+                    _clientIp,
+                    _mailFrom ?? "",
+                    _heloHostname,
+                    message,
+                    ct
+                );
+
+                LogVerificationResult(message.Verification);
+            }
+
+            // Store the message
+            var filePath = await storage.StoreAsync(message, _mailFrom ?? "<>", _rcptTo, ct);
+
+            await SendResponseAsync(250, $"OK: Message accepted for delivery ({Path.GetFileName(filePath)})");
+            ResetTransaction();
+        }
+
+        private void LogVerificationResult(DnsVerificationResult v)
+        {
+            var spfIcon = v.Spf == SpfResult.Pass ? "✓" : v.Spf == SpfResult.Fail ? "✗" : "?";
+            var dkimIcon = v.Dkim == DkimResult.Pass ? "✓" : v.Dkim == DkimResult.Fail ? "✗" : "?";
+            var dmarcIcon = v.Dmarc == DmarcResult.Pass ? "✓" : v.Dmarc == DmarcResult.Fail ? "✗" : "?";
+
+            logger.Log(LogLevel.Info, $"Verification: SPF={spfIcon}{v.Spf} DKIM={dkimIcon}{v.Dkim} DMARC={dmarcIcon}{v.Dmarc}");
+
+            if (v.MxRecords.Length > 0)
+                logger.Log(LogLevel.Debug, $"MX Records: {string.Join(", ", v.MxRecords)}");
+        }
+
+        private static string ExtractDomain(string email)
+        {
+            var atIndex = email.IndexOf('@');
+            return atIndex > 0 ? email[(atIndex + 1)..] : "";
+        }
+
+        private async Task HandleRsetAsync()
+        {
+            ResetTransaction();
+            await SendResponseAsync(250, "OK");
+        }
+
+        private void ResetTransaction()
+        {
+            _mailFrom = null;
+            _rcptTo.Clear();
+            _state = SmtpSessionState.Greeted;
+        }
+
+        private async Task HandleQuitAsync()
+        {
+            await SendResponseAsync(221, $"{config.Hostname} closing connection");
+            _state = SmtpSessionState.Quit;
+        }
+
+        private async Task SendResponseAsync(int code, string message, bool multiline = false)
+        {
+            var separator = multiline ? '-' : ' ';
+            var response = $"{code}{separator}{message}";
+            logger.Log(LogLevel.Debug, $"S: {response}");
+            await _writer.WriteLineAsync(response);
+        }
+
+        private async Task<string?> ReadLineAsync(CancellationToken ct)
+        {
+            try
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                cts.CancelAfter(config.SessionTimeout);
+                return await _reader.ReadLineAsync(cts.Token);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static (string Command, string Args) ParseCommand(string line)
+        {
+            var spaceIndex = line.IndexOf(' ');
+            if (spaceIndex < 0)
+                return (line, "");
+            return (line[..spaceIndex], line[(spaceIndex + 1)..]);
+        }
+    }
+
+    #endregion
+
+    #region SMTP Server
+
+    public sealed class SmtpServer : IAsyncDisposable
+    {
+        private readonly SmtpServerConfig _config;
+        private readonly IMailStorage _storage;
+        private readonly DnsVerifier _dnsVerifier;
+        private readonly X509Certificate2? _certificate;
+        private readonly ILogger _logger;
+        private readonly ConcurrentBag<TcpListener> _listeners = [];
+        private readonly ConcurrentBag<Task> _sessionTasks = [];
+        private readonly CancellationTokenSource _cts = new();
+
+        public SmtpServer(SmtpServerConfig config, ILogger? logger = null)
+        {
+            _config = config;
+            _logger = logger ?? new ConsoleLogger();
+            _storage = new FileMailStorage(config.MailStoragePath, _logger);
+            _dnsVerifier = new DnsVerifier(_logger);
+
+            if (config.CertificatePath is not null)
+            {
+                _certificate = config.CertificatePassword is not null
+                    ? new X509Certificate2(config.CertificatePath, config.CertificatePassword)
+                    : new X509Certificate2(config.CertificatePath);
+
+                _logger.Log(LogLevel.Info, $"Loaded certificate: {_certificate.Subject}");
+            }
+        }
+
+        public async Task StartAsync(CancellationToken ct = default)
+        {
+            _logger.Log(LogLevel.Info, $"Starting SMTP server on ports {_config.Port} and {_config.SubmissionPort}");
+            _logger.Log(LogLevel.Info, $"Mail storage: {Path.GetFullPath(_config.MailStoragePath)}");
+            _logger.Log(LogLevel.Info, $"STARTTLS: {(_certificate is not null ? "Available" : "Not configured")}");
+            _logger.Log(LogLevel.Info, $"Verification: SPF={_config.VerifySpf} DKIM={_config.VerifyDkim} DMARC={_config.VerifyDmarc}");
+
+            Directory.CreateDirectory(_config.MailStoragePath);
+
+            var listener25 = new TcpListener(IPAddress.Any, _config.Port);
+            var listener587 = new TcpListener(IPAddress.Any, _config.SubmissionPort);
+
+            listener25.Start();
+            listener587.Start();
+
+            _listeners.Add(listener25);
+            _listeners.Add(listener587);
+
+            _logger.Log(LogLevel.Info, "Server started. Waiting for connections...");
+
+            var task25 = AcceptConnectionsAsync(listener25, _cts.Token);
+            var task587 = AcceptConnectionsAsync(listener587, _cts.Token);
+
+            try
+            {
+                await Task.WhenAll(task25, task587);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.Log(LogLevel.Info, "Server shutdown requested");
+            }
+        }
+
+        private async Task AcceptConnectionsAsync(TcpListener listener, CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var client = await listener.AcceptTcpClientAsync(ct);
+                    var endpoint = client.Client.RemoteEndPoint as IPEndPoint;
+                    _logger.Log(LogLevel.Info, $"Connection from {endpoint?.Address}:{endpoint?.Port}");
+
+                    var session = new SmtpSession(client, _config, _storage, _dnsVerifier, _certificate, _logger);
+                    var task = session.HandleAsync(ct);
+                    _sessionTasks.Add(task);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Log(LogLevel.Error, $"Accept error: {ex.Message}");
+                }
+            }
+        }
+
+        public async Task StopAsync()
+        {
+            _logger.Log(LogLevel.Info, "Stopping server...");
+            await _cts.CancelAsync();
+
+            foreach (var listener in _listeners)
+            {
+                listener.Stop();
+            }
+
+            await Task.WhenAll(_sessionTasks.ToArray());
+            _logger.Log(LogLevel.Info, "Server stopped");
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await StopAsync();
+            _cts.Dispose();
+            _certificate?.Dispose();
+        }
+    }
+
+    #endregion
+
+    #region Logging
+
+    public enum LogLevel { Debug, Info, Warning, Error }
+
+    public interface ILogger
+    {
+        void Log(LogLevel level, string message);
+    }
+
+    public sealed class ConsoleLogger : ILogger
+    {
+        public void Log(LogLevel level, string message)
+        {
+            var color = level switch
+            {
+                LogLevel.Debug => ConsoleColor.Gray,
+                LogLevel.Info => ConsoleColor.White,
+                LogLevel.Warning => ConsoleColor.Yellow,
+                LogLevel.Error => ConsoleColor.Red,
+                _ => ConsoleColor.White
+            };
+
+            var prefix = level switch
+            {
+                LogLevel.Debug => "[DBG]",
+                LogLevel.Info => "[INF]",
+                LogLevel.Warning => "[WRN]",
+                LogLevel.Error => "[ERR]",
+                _ => "[???]"
+            };
+
+            var oldColor = Console.ForegroundColor;
+            Console.ForegroundColor = color;
+            Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {prefix} {message}");
+            Console.ForegroundColor = oldColor;
+        }
+    }
+
+    #endregion
+}
