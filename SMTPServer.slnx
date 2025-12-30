@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="SMTPServer/SMTPServer.csproj" />
-  <Project Path="SMTPTestClient/SMTPTestClient.csproj" />
-</Solution>
