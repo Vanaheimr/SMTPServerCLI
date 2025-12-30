@@ -786,8 +786,10 @@ public sealed class SmtpSession(
     ILogger            logger)
 {
     private Stream              _stream       = client.GetStream();
-    private StreamReader        _reader       = new(client.GetStream(), Encoding.ASCII);
-    private StreamWriter        _writer       = new(client.GetStream(), Encoding.ASCII) { AutoFlush = true };
+    // Use Latin1 (ISO-8859-1) encoding: 1:1 byte-to-char mapping for 0-255
+    // ASCII only handles 0-127, which breaks BDAT with binary data!
+    private StreamReader        _reader       = new(client.GetStream(), Encoding.Latin1);
+    private StreamWriter        _writer       = new(client.GetStream(), Encoding.Latin1) { AutoFlush = true };
     private SmtpSessionState    _state        = SmtpSessionState.Connected;
     private string?             _mailFrom;
     private readonly List<string> _rcptTo     = [];
@@ -1094,8 +1096,8 @@ public sealed class SmtpSession(
             );
 
             _stream = sslStream;
-            _reader = new StreamReader(sslStream, Encoding.ASCII);
-            _writer = new StreamWriter(sslStream, Encoding.ASCII) { AutoFlush = true };
+            _reader = new StreamReader(sslStream, Encoding.Latin1);
+            _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true };
             _tlsActive = true;
             _state = SmtpSessionState.Connected;
 
@@ -1504,27 +1506,34 @@ public sealed class SmtpSession(
         }
 
         // Read exact number of bytes
-        var buffer = new byte[chunkSize];
-        var bytesRead = 0;
+        // IMPORTANT: We must read from _reader (not _stream) because StreamReader buffers!
+        // The StreamReader may have already read ahead and buffered the BDAT data.
+        var charBuffer = new char[chunkSize];
+        var charsRead = 0;
         
-        while (bytesRead < chunkSize)
+        while (charsRead < chunkSize)
         {
-            var read = await _stream.ReadAsync(buffer.AsMemory(bytesRead, chunkSize - bytesRead), ct);
+            var read = await _reader.ReadBlockAsync(charBuffer.AsMemory(charsRead, chunkSize - charsRead), ct);
             if (read == 0)
             {
                 await SendResponseAsync(451, "4.3.0 Connection lost during BDAT");
                 ResetTransaction();
                 return;
             }
-            bytesRead += read;
+            charsRead += read;
         }
 
+        // Convert chars back to bytes using Latin1 (1:1 mapping)
+        // The StreamReader uses Latin1, so each char == one byte
+        var buffer = Encoding.Latin1.GetBytes(charBuffer, 0, chunkSize);
+
         // Append to buffer
-        _bdatBuffer.Write(buffer, 0, chunkSize);
+        _bdatBuffer.Write(buffer, 0, buffer.Length);
 
         if (isLast)
         {
             // Process the complete message
+            // Message content is typically UTF-8 encoded
             var rawMessage = Encoding.UTF8.GetString(_bdatBuffer.ToArray());
             _bdatBuffer.SetLength(0);
             _inBdatSequence = false;

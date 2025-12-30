@@ -246,7 +246,8 @@ static async Task TestWithStartTlsAndAuthPlain_BDAT(String host, UInt16 port)
                                              "Benefits:" + Environment.NewLine +
                                              "- No need for dot-stuffing (escaping lines starting with \".\")" + Environment.NewLine +
                                              "- Binary-safe transmission" + Environment.NewLine +
-                                             "- Can send in multiple chunks"
+                                             "- Can send in multiple chunks" + Environment.NewLine + Environment.NewLine +
+                                             "Grüße aus München!"
 
                             };
 
@@ -254,8 +255,8 @@ static async Task TestWithStartTlsAndAuthPlain_BDAT(String host, UInt16 port)
         var messageBytes  = Encoding.UTF8.GetBytes(message);
 
         // Send message in two chunks to demonstrate chunking
-        var chunk1Size = messageBytes.Length / 2;
-        var chunk2Size = messageBytes.Length - chunk1Size;
+        var chunk1Size    = messageBytes.Length / 2;
+        var chunk2Size    = messageBytes.Length - chunk1Size;
 
         // First chunk (not LAST)
         Console.WriteLine($"C: BDAT {chunk1Size}");

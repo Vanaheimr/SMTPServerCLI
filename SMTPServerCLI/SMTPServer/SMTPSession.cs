@@ -53,8 +53,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
     {
 
         private Stream                         _stream         = client.GetStream();
-        private StreamReader                   _reader         = new (client.GetStream(), Encoding.ASCII);
-        private StreamWriter                   _writer         = new (client.GetStream(), Encoding.ASCII) { AutoFlush = true };
+        // Use Latin1 (ISO-8859-1) encoding: 1:1 byte-to-char mapping for 0-255
+        // ASCII only handles 0-127, which breaks BDAT with binary data!
+        private StreamReader                   _reader         = new(client.GetStream(), Encoding.Latin1);
+        private StreamWriter                   _writer         = new(client.GetStream(), Encoding.Latin1) { AutoFlush = true };
         private SMTPSessionState               _state          = SMTPSessionState.Connected;
         private String?                        _mailFrom;
         private readonly List<String>          _rcptTo         = [];
@@ -384,8 +386,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 );
 
                 _stream = sslStream;
-                _reader = new StreamReader(sslStream, Encoding.ASCII);
-                _writer = new StreamWriter(sslStream, Encoding.ASCII) { AutoFlush = true };
+                _reader = new StreamReader(sslStream, Encoding.Latin1);
+                _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true };
                 _tlsActive = true;
                 _state = SMTPSessionState.Connected;
 
@@ -670,9 +672,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             }
 
 
-            var charBuffer = new Char[chunkSize];
-            var charsRead  = 0;
-
+            // Read exact number of bytes
+            // IMPORTANT: We must read from _reader (not _stream) because StreamReader buffers!
+            // The StreamReader may have already read ahead and buffered the BDAT data.
+            var charBuffer = new char[chunkSize];
+            var charsRead = 0;
+        
             while (charsRead < chunkSize)
             {
                 var read = await _reader.ReadBlockAsync(charBuffer.AsMemory(charsRead, chunkSize - charsRead), ct);
@@ -685,8 +690,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 charsRead += read;
             }
 
-            // Convert chars to bytes (works for ASCII/UTF-8 text content)
-            var buffer = Encoding.UTF8.GetBytes(charBuffer, 0, chunkSize);
+            // Convert chars back to bytes using Latin1 (1:1 mapping)
+            // The StreamReader uses Latin1, so each char == one byte
+            var buffer = Encoding.Latin1.GetBytes(charBuffer, 0, chunkSize);
 
             // Append to buffer
             _bdatBuffer.Write(buffer, 0, buffer.Length);
@@ -694,6 +700,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             if (isLast)
             {
                 // Process the complete message
+                // Message content is typically UTF-8 encoded
                 var rawMessage = Encoding.UTF8.GetString(_bdatBuffer.ToArray());
                 _bdatBuffer.SetLength(0);
                 _inBdatSequence = false;
@@ -705,7 +712,6 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 // More chunks expected
                 await SendResponseAsync(250, $"2.0.0 {chunkSize} bytes received, continue");
             }
-
         }
 
 
@@ -715,7 +721,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private async Task ProcessReceivedMessageAsync(String rawMessage, CancellationToken ct)
         {
 
-            var message = EMailMessage.Parse(rawMessage);
+            var message   = EMailMessage.  Parse(rawMessage);
+            var message2  = EmailMessageV2.Parse(rawMessage);
 
             // Perform DNS verification (for inbound mail from other servers)
             var senderDomain = ExtractDomain(_mailFrom ?? "");

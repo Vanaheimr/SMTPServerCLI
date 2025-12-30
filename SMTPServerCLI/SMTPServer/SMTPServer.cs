@@ -106,7 +106,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             // Port 25:  MTA-to-MTA (inbound)
             var task25   = AcceptConnections(listener25,  isSubmissionPort: false, _cts.Token);
 
-            // Port 587: MUA-to-MTA (submission)
+            // Port 465  "SMTPS": RFC 8314
+
+            // Port 587: MUA-to-MTA (submission) RFC 6409
+            //           AUTH required
+            //           StartTLS mandatory
             var task587  = AcceptConnections(listener587, isSubmissionPort: true,  _cts.Token);
 
             try
