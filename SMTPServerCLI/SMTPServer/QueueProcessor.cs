@@ -49,7 +49,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
     {
 
         private readonly IMailQueue                              mailQueue;
-        private readonly SmtpOutboundClient                      smtpOutboundClient;
+        private readonly SMTPOutboundClient                      smtpOutboundClient;
         private readonly BounceHandler                           bounceHandler;
         private readonly QueueProcessorConfig                    queueProcessorConfig;
         private readonly ILogger                                 logger;
@@ -69,7 +69,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             => queueProcessorConfig.MaxConcurrentDeliveries - (UInt32) _deliverySemaphore.CurrentCount;
 
         public QueueProcessor(IMailQueue             MailQueue,
-                              SmtpOutboundClient     SMTPOutboundClient,
+                              SMTPOutboundClient     SMTPOutboundClient,
                               BounceHandler          BounceHandler,
                               QueueProcessorConfig?  QueueProcessorConfig,
                               ILogger                Logger)
@@ -276,6 +276,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     mail.EnvelopeFrom,
                     mail.EnvelopeTo,
                     mail.MessageContent,
+                    mail.RequireTls,
                     ct
                 );
 

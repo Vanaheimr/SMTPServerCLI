@@ -39,15 +39,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         Quit
     }
 
-    public sealed class SMTPSession(TcpClient          client,
-                                    SMTPServerConfig   config,
-                                    IMailStorage       storage,
-                                    DNSVerifier        dnsVerifier,
-                                    X509Certificate2?  certificate,
-                                    IUserStore         userStore,
-                                    IMailQueue?        mailQueue,
-                                    Boolean            isSubmissionPort,
-                                    ILogger            logger)
+    public sealed class SMTPSession(TcpClient           client,
+                                    SMTPServerConfig    config,
+                                    IMailStorage        storage,
+                                    DNSVerifier         dnsVerifier,
+                                    X509Certificate2?   certificate,
+                                    IUserStore          userStore,
+                                    IMailQueue?         mailQueue,
+                                    Boolean             isSubmissionPort,
+                                    ConnectionTracker?  connectionTracker,
+                                    RateLimitConfig     rateLimitConfig,
+                                    ILogger             logger)
     {
 
         private Stream                         _stream         = client.GetStream();
@@ -65,8 +67,29 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private Boolean                        _inAuthExchange;
         private X509Certificate2?              _clientCertificate;
 
+        // DSN support (RFC 3461)
+        private string?                        _dsnEnvId;
+        private DsnRet                         _dsnRet          = DsnRet.Full;
+        private readonly List<RecipientDsn>    _recipientDsns   = [];
+
+        // REQUIRETLS support (RFC 8689)
+        private bool                           _requireTls;
+
+        // BDAT/CHUNKING support (RFC 3030)
+        private bool                           _inBdatSequence;
+        private readonly MemoryStream          _bdatBuffer      = new();
+
+        // Rate limiting
+        private readonly SessionCounters       _counters        = new();
+
+
+
         public async Task HandleAsync(CancellationToken ct)
         {
+
+            // Register connection for rate limiting
+            connectionTracker?.RegisterConnection(_clientIp);
+
             try
             {
                 await SendResponseAsync(220, $"{config.Hostname} ESMTP AchimSMTP ready");
@@ -91,6 +114,15 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                     if (_state == SMTPSessionState.Quit)
                         break;
+
+                    // Check for too many invalid commands
+                    if (_counters.InvalidCommands >= rateLimitConfig.MaxInvalidCommands)
+                    {
+                        logger.Log(LogLevel.Warning, $"Too many invalid commands from {_clientIp}, disconnecting");
+                        await SendResponseAsync(421, "4.7.0 Too many errors, closing connection");
+                        break;
+                    }
+
                 }
             }
             catch (OperationCanceledException)
@@ -103,6 +135,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             }
             finally
             {
+                connectionTracker?.UnregisterConnection(_clientIp);
+                _bdatBuffer.Dispose();
                 client.Close();
             }
         }
@@ -140,6 +174,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     break;
 
                 case "AUTH":
+                    if (connectionTracker is not null && !connectionTracker.CanAttemptAuth(_clientIp))
+                    {
+                        await SendResponseAsync(421, "4.7.0 Too many authentication attempts, try again later");
+                        return;
+                    }
                     await HandleAuthAsync(args, ct);
                     break;
 
@@ -153,6 +192,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 case "DATA":
                     await HandleDataAsync(ct);
+                    break;
+
+                case "BDAT":
+                    await HandleBdatAsync(args, ct);
                     break;
 
                 case "RSET":
@@ -172,6 +215,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     break;
 
                 default:
+                    _counters.InvalidCommands++;
                     await SendResponseAsync(500, "Unrecognized command");
                     break;
 
@@ -187,30 +231,37 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         private async Task HandleEhloAsync(String hostname)
         {
-            _heloHostname = hostname;
-            _state = SMTPSessionState.Greeted;
 
-            var extensions = new List<String>
-            {
+            _heloHostname   = hostname;
+            _state          = SMTPSessionState.Greeted;
+
+            var extensions  = new List<String> {
                 $"{config.Hostname} Hello {hostname}",
                 $"SIZE {config.MaxMessageSize}",
                 "8BITMIME",
                 "ENHANCEDSTATUSCODES",
-                "PIPELINING"
+                "CHUNKING",  // RFC 3030 - BDAT command
+                "DSN",       // RFC 3461 - Delivery Status Notifications
+                "SMTPUTF8"   // RFC 6531 - Internationalized Email
             };
 
             if (certificate is not null && !_tlsActive)
                 extensions.Add("STARTTLS");
+
+            // REQUIRETLS only available after STARTTLS (RFC 8689)
+            if (_tlsActive)
+                extensions.Add("REQUIRETLS");
 
             // Advertise AUTH mechanisms
             var authMechanisms = _authManager.GetAvailableMechanisms(_tlsActive).ToList();
             if (authMechanisms.Count > 0)
                 extensions.Add($"AUTH {String.Join(' ', authMechanisms)}");
 
-            for (int i = 0; i < extensions.Count - 1; i++)
+            for (var i = 0; i < extensions.Count - 1; i++)
                 await SendResponseAsync(250, extensions[i], multiline: true);
-        
+
             await SendResponseAsync(250, extensions[^1]);
+
         }
 
         private async Task HandleAuthAsync(String args, CancellationToken ct)
@@ -375,6 +426,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         private async Task HandleMailFromAsync(String args)
         {
+
             if (_state < SMTPSessionState.Greeted)
             {
                 await SendResponseAsync(503, "Say HELO first");
@@ -383,22 +435,47 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             if (config.RequireStartTls && !_tlsActive)
             {
-                await SendResponseAsync(530, "Must issue STARTTLS first");
+                await SendResponseAsync(530, "5.7.0 Must issue STARTTLS first");
                 return;
             }
 
             var match = Regex.Match(args, @"FROM:\s*<([^>]*)>", RegexOptions.IgnoreCase);
             if (!match.Success)
             {
-                await SendResponseAsync(501, "Syntax error in MAIL command");
+                await SendResponseAsync(501, "5.5.4 Syntax error in MAIL command");
                 return;
             }
 
             _mailFrom = match.Groups[1].Value;
+
+            // Get everything after the closing >
+            var paramStart = args.IndexOf('>');
+            var parameters = paramStart > 0 ? args[(paramStart + 1)..].Trim() : "";
+
+            // Parse DSN parameters (RFC 3461)
+            var (envId, ret) = DsnParser.ParseMailFromParams(parameters);
+            _dsnEnvId = envId;
+            _dsnRet   = ret;
+
+            // Parse REQUIRETLS (RFC 8689)
+            _requireTls = RequireTlsHandler.ParseRequireTls(parameters);
+            if (_requireTls && !_tlsActive)
+            {
+                await SendResponseAsync(530, "5.7.0 REQUIRETLS requires active TLS connection");
+                return;
+            }
+
+            // Reset state
             _rcptTo.Clear();
+            _localRcptTo.Clear();
+            _remoteRcptTo.Clear();
+            _recipientDsns.Clear();
+            _inBdatSequence = false;
+            _bdatBuffer.SetLength(0);
             _state = SMTPSessionState.MailFrom;
 
-            await SendResponseAsync(250, "OK");
+            await SendResponseAsync(250, "2.1.0 OK");
+
         }
 
         private async Task HandleRcptToAsync(String args)
@@ -406,25 +483,30 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             if (_state < SMTPSessionState.MailFrom)
             {
-                await SendResponseAsync(503, "Need MAIL command first");
+                await SendResponseAsync(503, "5.5.1 Need MAIL command first");
                 return;
             }
 
             var match = Regex.Match(args, @"TO:\s*<([^>]+)>", RegexOptions.IgnoreCase);
             if (!match.Success)
             {
-                await SendResponseAsync(501, "Syntax error in RCPT command");
+                await SendResponseAsync(501, "5.5.4 Syntax error in RCPT command");
                 return;
             }
 
             if (_rcptTo.Count >= config.MaxRecipients)
             {
-                await SendResponseAsync(452, "Too many recipients");
+                await SendResponseAsync(452, "4.5.3 Too many recipients");
                 return;
             }
 
             var recipient       = match.Groups[1].Value;
             var recipientDomain = ExtractDomain(recipient);
+
+            // Parse DSN parameters (RFC 3461)
+            var paramStart = args.IndexOf('>');
+            var parameters = paramStart > 0 ? args[(paramStart + 1)..].Trim() : "";
+            var (notify, orcpt) = DsnParser.ParseRcptToParams(parameters);
 
             // Check if this is a local or remote recipient
             var isLocalRecipient = config.IsLocalDomain(recipientDomain);
@@ -435,7 +517,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 // Require authentication to prevent open relay
                 if (config.RequireAuthForRelay && !_authManager.IsAuthenticated)
                 {
-                    logger.Log(LogLevel.Warning, 
+                    logger.Log(LogLevel.Warning,
                         $"Relay denied for {recipient}: not authenticated (from {_clientIp})");
                     await SendResponseAsync(550, "5.7.1 Relay access denied. Authentication required.");
                     return;
@@ -457,18 +539,43 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 logger.Log(LogLevel.Debug, $"Submission port recipient (auth check deferred): {recipient}");
             }
 
+            // Store DSN info for this recipient
+            _recipientDsns.Add(
+                new RecipientDsn {
+                    Recipient          = recipient,
+                    Notify             = notify,
+                    OriginalRecipient  = orcpt
+                }
+            );
+
             _rcptTo.Add(recipient);
             _state = SMTPSessionState.RcptTo;
 
-            await SendResponseAsync(250, "OK");
+            await SendResponseAsync(250, "2.1.5 OK");
 
         }
 
         private async Task HandleDataAsync(CancellationToken ct)
         {
+
             if (_state < SMTPSessionState.RcptTo || _rcptTo.Count == 0)
             {
-                await SendResponseAsync(503, "Need RCPT command first");
+                await SendResponseAsync(503, "5.5.1 Need RCPT command first");
+                return;
+            }
+
+            // Submission port requires authentication per RFC 6409
+            if (isSubmissionPort && config.RequireAuthOnSubmission && !_authManager.IsAuthenticated)
+            {
+                await SendResponseAsync(530, "5.7.0 Authentication required");
+                return;
+            }
+
+            // Check message rate limit
+            if (connectionTracker is not null && 
+                !connectionTracker.CanSendMessage(_clientIp, _authManager.IsAuthenticated))
+            {
+                await SendResponseAsync(452, "4.7.1 Too many messages, try again later");
                 return;
             }
 
@@ -497,7 +604,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 totalSize += line.Length + 2;
                 if (totalSize > config.MaxMessageSize)
                 {
-                    await SendResponseAsync(552, "Message size exceeds maximum");
+                    await SendResponseAsync(552, "5.3.4 Message size exceeds maximum");
                     ResetTransaction();
                     return;
                 }
@@ -507,13 +614,117 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             }
 
             var rawMessage = messageBuilder.ToString();
+
+            await ProcessReceivedMessageAsync(rawMessage, ct);
+
+        }
+
+
+        /// <summary>
+        /// Handle BDAT command (RFC 3030 CHUNKING)
+        /// BDAT allows sending message data in chunks without dot-stuffing
+        /// </summary>
+        private async Task HandleBdatAsync(String args, CancellationToken ct)
+        {
+
+            if (_state < SMTPSessionState.RcptTo || _rcptTo.Count == 0)
+            {
+                await SendResponseAsync(503, "5.5.1 Need RCPT command first");
+                return;
+            }
+
+            // Parse BDAT arguments: BDAT <size> [LAST]
+            var parts = args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 1 || !int.TryParse(parts[0], out var chunkSize))
+            {
+                await SendResponseAsync(501, "5.5.4 Syntax: BDAT size [LAST]");
+                return;
+            }
+
+            var isLast = parts.Length > 1 && parts[1].Equals("LAST", StringComparison.OrdinalIgnoreCase);
+
+            // Validate chunk size
+            if (chunkSize < 0)
+            {
+                await SendResponseAsync(501, "5.5.4 Invalid chunk size");
+                return;
+            }
+
+            if (_bdatBuffer.Length + chunkSize > config.MaxMessageSize)
+            {
+                await SendResponseAsync(552, "5.3.4 Message size exceeds maximum");
+                ResetTransaction();
+                return;
+            }
+
+            // Check message rate limit on first chunk
+            if (!_inBdatSequence)
+            {
+                if (connectionTracker is not null && 
+                    !connectionTracker.CanSendMessage(_clientIp, _authManager.IsAuthenticated))
+                {
+                    await SendResponseAsync(452, "4.7.1 Too many messages, try again later");
+                    return;
+                }
+                _inBdatSequence = true;
+            }
+
+
+            var charBuffer = new Char[chunkSize];
+            var charsRead  = 0;
+
+            while (charsRead < chunkSize)
+            {
+                var read = await _reader.ReadBlockAsync(charBuffer.AsMemory(charsRead, chunkSize - charsRead), ct);
+                if (read == 0)
+                {
+                    await SendResponseAsync(451, "4.3.0 Connection lost during BDAT");
+                    ResetTransaction();
+                    return;
+                }
+                charsRead += read;
+            }
+
+            // Convert chars to bytes (works for ASCII/UTF-8 text content)
+            var buffer = Encoding.UTF8.GetBytes(charBuffer, 0, chunkSize);
+
+            // Append to buffer
+            _bdatBuffer.Write(buffer, 0, buffer.Length);
+
+            if (isLast)
+            {
+                // Process the complete message
+                var rawMessage = Encoding.UTF8.GetString(_bdatBuffer.ToArray());
+                _bdatBuffer.SetLength(0);
+                _inBdatSequence = false;
+            
+                await ProcessReceivedMessageAsync(rawMessage, ct);
+            }
+            else
+            {
+                // More chunks expected
+                await SendResponseAsync(250, $"2.0.0 {chunkSize} bytes received, continue");
+            }
+
+        }
+
+
+        /// <summary>
+        /// Process a received message (from DATA or BDAT)
+        /// </summary>
+        private async Task ProcessReceivedMessageAsync(String rawMessage, CancellationToken ct)
+        {
+
             var message = EMailMessage.Parse(rawMessage);
 
-            // Perform DNS verification
+            // Perform DNS verification (for inbound mail from other servers)
             var senderDomain = ExtractDomain(_mailFrom ?? "");
-            if (!string.IsNullOrEmpty(senderDomain))
+            DnsVerificationResult? verification = null;
+
+            if (!String.IsNullOrEmpty(senderDomain) && !_authManager.IsAuthenticated)
             {
-                message.Verification = await dnsVerifier.VerifyAsync(
+                // Only verify external mail (not from authenticated local users)
+                verification = await dnsVerifier.VerifyAsync(
                     senderDomain,
                     _clientIp,
                     _mailFrom ?? "",
@@ -521,44 +732,133 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     message,
                     ct
                 );
+                message.Verification = verification;
 
-                LogVerificationResult(message.Verification);
+                LogVerificationResult(verification);
+
+                // === SPF HARD-FAIL REJECT ===
+                if (verification.Spf == SPFResult.Fail)
+                {
+                    logger.Log(LogLevel.Warning, $"SPF hard-fail for {_mailFrom} from {_clientIp}");
+                    await SendResponseAsync(550, $"5.7.23 SPF validation failed: {senderDomain} does not authorize {_clientIp}");
+                    ResetTransaction();
+                    return;
+                }
+
+                // === DKIM FAIL REJECT ===
+                if (verification.Dkim == DkimResult.Fail)
+                {
+                    logger.Log(LogLevel.Warning, $"DKIM verification failed for message from {_mailFrom}");
+                    await SendResponseAsync(550, "5.7.20 DKIM signature verification failed");
+                    ResetTransaction();
+                    return;
+                }
+
+                // === DMARC POLICY ENFORCEMENT ===
+                if (verification.Dmarc == DmarcResult.Fail)
+                {
+
+                    var dmarcPolicy = verification.DmarcPolicy?.ToLowerInvariant() ?? "none";
+
+                    switch (dmarcPolicy)
+                    {
+
+                        case "reject":
+                            logger.Log(LogLevel.Warning, $"DMARC reject policy for {senderDomain}");
+                            await SendResponseAsync(550, $"5.7.1 DMARC policy violation: {senderDomain} has p=reject");
+                            ResetTransaction();
+                            return;
+
+                        case "quarantine":
+                            logger.Log(LogLevel.Warning, $"DMARC quarantine policy for {senderDomain} - marking as suspicious");
+                            message.Headers.Add(new KeyValuePair<String, String>("X-DMARC-Quarantine", "true"));
+                            break;
+
+                        case "none":
+                        default:
+                            // Log but deliver
+                            logger.Log(LogLevel.Info, $"DMARC failed but policy is {dmarcPolicy} for {senderDomain}");
+                            break;
+
+                    }
+
+                }
             }
 
-            // Store the message locally
-            var filePath = await storage.StoreAsync(message, _mailFrom ?? "<>", _rcptTo, ct);
+            // Record message for rate limiting
+            connectionTracker?.RecordMessage(_clientIp);
+            _counters.Messages++;
 
-            // Queue for outbound delivery if mail queue is available
-            if (mailQueue is not null)
+            // Determine what to do with the message
+            var hasLocalRecipients = _localRcptTo.Count > 0;
+            var hasRemoteRecipients = _remoteRcptTo.Count > 0;
+
+            logger.Log(LogLevel.Info, 
+                $"Message from {_mailFrom}: {_localRcptTo.Count} local, {_remoteRcptTo.Count} remote recipients");
+
+            // Store locally for local recipients
+            string? filePath = null;
+            if (hasLocalRecipients)
             {
+                filePath = await storage.StoreAsync(message, _mailFrom ?? "<>", _localRcptTo, ct);
+                logger.Log(LogLevel.Info, $"Stored locally: {Path.GetFileName(filePath)}");
+            }
 
-                // Group recipients by domain
-                var recipientsByDomain = _rcptTo
+            // Queue for outbound delivery for remote recipients (relay)
+            if (hasRemoteRecipients && mailQueue is not null)
+            {
+                // This should only happen if user is authenticated (checked in RCPT TO)
+                // But double-check here for safety
+                if (!_authManager.IsAuthenticated && config.RequireAuthForRelay)
+                {
+                    logger.Log(LogLevel.Error, "BUG: Remote recipients without auth - this should not happen!");
+                    await SendResponseAsync(550, "5.7.1 Relay access denied");
+                    ResetTransaction();
+                    return;
+                }
+
+                // Group remote recipients by domain for efficient delivery
+                var recipientsByDomain = _remoteRcptTo
                     .GroupBy(r => ExtractDomain(r))
                     .Where(g => !string.IsNullOrEmpty(g.Key));
 
                 foreach (var domainGroup in recipientsByDomain)
                 {
+                    var mailId = filePath is not null
+                        ? $"{Path.GetFileNameWithoutExtension(filePath)}-{domainGroup.Key}"
+                        : $"{Guid.NewGuid():N}-{domainGroup.Key}";
 
-                    var queuedMail = new QueuedMail {
-                                         Id              = $"{Path.GetFileNameWithoutExtension(filePath)}-{domainGroup.Key}",
-                                         EnvelopeFrom    = _mailFrom ?? "",
-                                         EnvelopeTo      = [.. domainGroup],
-                                         MessageContent  = rawMessage,
-                                         TargetDomain    = domainGroup.Key,
-                                         QueuedAt        = DateTime.UtcNow,
-                                         NextRetry       = DateTime.UtcNow
-                                     };
+                    var queuedMail = new QueuedMail
+                    {
+                        Id = mailId,
+                        EnvelopeFrom = _mailFrom ?? "",
+                        EnvelopeTo = domainGroup.ToArray(),
+                        MessageContent = rawMessage,
+                        TargetDomain = domainGroup.Key,
+                        QueuedAt = DateTime.UtcNow,
+                        NextRetry = DateTime.UtcNow
+                    };
 
                     await mailQueue.EnqueueAsync(queuedMail, ct);
-
+                    logger.Log(LogLevel.Info, $"Queued for relay to {domainGroup.Key}: {domainGroup.Count()} recipients");
                 }
             }
 
-            await SendResponseAsync(250, $"OK: Message accepted for delivery ({Path.GetFileName(filePath)})");
+            // Also store a copy locally for remote mail if configured (for sent mail archive)
+            if (hasRemoteRecipients && !hasLocalRecipients)
+            {
+                // Optionally store sent mail - for now just log
+                logger.Log(LogLevel.Debug, "Outbound-only message (not stored locally)");
+            }
+
+            await SendResponseAsync(250, "2.0.0 OK: Message accepted for delivery");
             ResetTransaction();
 
         }
+
+
+
+
 
         private void LogVerificationResult(DnsVerificationResult v)
         {
@@ -589,9 +889,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         private void ResetTransaction()
         {
-            _mailFrom = null;
-            _rcptTo.Clear();
-            _state = SMTPSessionState.Greeted;
+            _mailFrom        = null;
+            _dsnEnvId        = null;
+            _dsnRet          = DsnRet.Full;
+            _requireTls      = false;
+            _inBdatSequence  = false;
+            _state           = SMTPSessionState.Greeted;
+            _rcptTo.       Clear();
+            _localRcptTo.  Clear();
+            _remoteRcptTo. Clear();
+            _recipientDsns.Clear();
+            _bdatBuffer.   SetLength(0);
         }
 
         private async Task HandleQuitAsync()

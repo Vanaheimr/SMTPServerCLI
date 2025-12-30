@@ -34,6 +34,7 @@ public sealed class QueuedMail
     public DateTime?         DeliveredAt     { get; set; }
     public string?           RemoteMx        { get; set; }
     public string?           RemoteResponse  { get; set; }
+    public bool              RequireTls      { get; init; } = false;  // RFC 8689
 }
 
 #endregion

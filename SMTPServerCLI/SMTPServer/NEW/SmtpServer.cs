@@ -781,6 +781,8 @@ public sealed class SmtpSession(
     IUserStore         userStore,
     IMailQueue?        mailQueue,
     bool               isSubmissionPort,
+    ConnectionTracker? connectionTracker,
+    RateLimitConfig    rateLimitConfig,
     ILogger            logger)
 {
     private Stream              _stream       = client.GetStream();
@@ -797,9 +799,27 @@ public sealed class SmtpSession(
     private readonly SmtpAuthManager _authManager = new(userStore, logger);
     private bool                _inAuthExchange;
     private X509Certificate2?   _clientCertificate;
+    
+    // DSN support (RFC 3461)
+    private string?             _dsnEnvId;
+    private DsnRet              _dsnRet = DsnRet.Full;
+    private readonly List<RecipientDsn> _recipientDsns = [];
+    
+    // REQUIRETLS support (RFC 8689)
+    private bool                _requireTls;
+    
+    // BDAT/CHUNKING support (RFC 3030)
+    private bool                _inBdatSequence;
+    private readonly MemoryStream _bdatBuffer = new();
+    
+    // Rate limiting
+    private readonly SessionCounters _counters = new();
 
     public async Task HandleAsync(CancellationToken ct)
     {
+        // Register connection for rate limiting
+        connectionTracker?.RegisterConnection(_clientIp);
+        
         try
         {
             await SendResponseAsync(220, $"{config.Hostname} ESMTP AchimSMTP ready");
@@ -824,6 +844,14 @@ public sealed class SmtpSession(
 
                 if (_state == SmtpSessionState.Quit)
                     break;
+                    
+                // Check for too many invalid commands
+                if (_counters.InvalidCommands >= rateLimitConfig.MaxInvalidCommands)
+                {
+                    logger.Log(LogLevel.Warning, $"Too many invalid commands from {_clientIp}, disconnecting");
+                    await SendResponseAsync(421, "4.7.0 Too many errors, closing connection");
+                    break;
+                }
             }
         }
         catch (OperationCanceledException)
@@ -836,6 +864,8 @@ public sealed class SmtpSession(
         }
         finally
         {
+            connectionTracker?.UnregisterConnection(_clientIp);
+            _bdatBuffer.Dispose();
             client.Close();
         }
     }
@@ -869,6 +899,12 @@ public sealed class SmtpSession(
                 await HandleStartTlsAsync(ct);
                 break;
             case "AUTH":
+                // Check rate limiting for AUTH
+                if (connectionTracker is not null && !connectionTracker.CanAttemptAuth(_clientIp))
+                {
+                    await SendResponseAsync(421, "4.7.0 Too many authentication attempts, try again later");
+                    return;
+                }
                 await HandleAuthAsync(args, ct);
                 break;
             case "MAIL":
@@ -879,6 +915,9 @@ public sealed class SmtpSession(
                 break;
             case "DATA":
                 await HandleDataAsync(ct);
+                break;
+            case "BDAT":
+                await HandleBdatAsync(args, ct);
                 break;
             case "RSET":
                 await HandleRsetAsync();
@@ -893,7 +932,8 @@ public sealed class SmtpSession(
                 await SendResponseAsync(252, "Cannot verify user");
                 break;
             default:
-                await SendResponseAsync(500, "Unrecognized command");
+                _counters.InvalidCommands++;
+                await SendResponseAsync(500, "5.5.1 Unrecognized command");
                 break;
         }
     }
@@ -916,11 +956,17 @@ public sealed class SmtpSession(
             $"SIZE {config.MaxMessageSize}",
             "8BITMIME",
             "ENHANCEDSTATUSCODES",
-            "PIPELINING"
+            "CHUNKING",                             // RFC 3030 - BDAT command
+            "DSN",                                  // RFC 3461 - Delivery Status Notifications
+            "SMTPUTF8"                              // RFC 6531 - Internationalized Email
         };
 
         if (certificate is not null && !_tlsActive)
             extensions.Add("STARTTLS");
+
+        // REQUIRETLS only available after STARTTLS (RFC 8689)
+        if (_tlsActive)
+            extensions.Add("REQUIRETLS");
 
         // Advertise AUTH mechanisms
         var authMechanisms = _authManager.GetAvailableMechanisms(_tlsActive).ToList();
@@ -1094,47 +1140,76 @@ public sealed class SmtpSession(
 
         if (config.RequireStartTls && !_tlsActive)
         {
-            await SendResponseAsync(530, "Must issue STARTTLS first");
+            await SendResponseAsync(530, "5.7.0 Must issue STARTTLS first");
             return;
         }
 
         var match = Regex.Match(args, @"FROM:\s*<([^>]*)>", RegexOptions.IgnoreCase);
         if (!match.Success)
         {
-            await SendResponseAsync(501, "Syntax error in MAIL command");
+            await SendResponseAsync(501, "5.5.4 Syntax error in MAIL command");
             return;
         }
 
         _mailFrom = match.Groups[1].Value;
+        
+        // Get everything after the closing >
+        var paramStart = args.IndexOf('>');
+        var parameters = paramStart > 0 ? args[(paramStart + 1)..].Trim() : "";
+
+        // Parse DSN parameters (RFC 3461)
+        var (envId, ret) = DsnParser.ParseMailFromParams(parameters);
+        _dsnEnvId = envId;
+        _dsnRet = ret;
+
+        // Parse REQUIRETLS (RFC 8689)
+        _requireTls = RequireTlsHandler.ParseRequireTls(parameters);
+        if (_requireTls && !_tlsActive)
+        {
+            await SendResponseAsync(530, "5.7.0 REQUIRETLS requires active TLS connection");
+            return;
+        }
+
+        // Reset state
         _rcptTo.Clear();
+        _localRcptTo.Clear();
+        _remoteRcptTo.Clear();
+        _recipientDsns.Clear();
+        _inBdatSequence = false;
+        _bdatBuffer.SetLength(0);
         _state = SmtpSessionState.MailFrom;
 
-        await SendResponseAsync(250, "OK");
+        await SendResponseAsync(250, "2.1.0 OK");
     }
 
     private async Task HandleRcptToAsync(string args)
     {
         if (_state < SmtpSessionState.MailFrom)
         {
-            await SendResponseAsync(503, "Need MAIL command first");
+            await SendResponseAsync(503, "5.5.1 Need MAIL command first");
             return;
         }
 
         var match = Regex.Match(args, @"TO:\s*<([^>]+)>", RegexOptions.IgnoreCase);
         if (!match.Success)
         {
-            await SendResponseAsync(501, "Syntax error in RCPT command");
+            await SendResponseAsync(501, "5.5.4 Syntax error in RCPT command");
             return;
         }
 
         if (_rcptTo.Count >= config.MaxRecipients)
         {
-            await SendResponseAsync(452, "Too many recipients");
+            await SendResponseAsync(452, "4.5.3 Too many recipients");
             return;
         }
 
         var recipient = match.Groups[1].Value;
         var recipientDomain = ExtractDomain(recipient);
+
+        // Parse DSN parameters (RFC 3461)
+        var paramStart = args.IndexOf('>');
+        var parameters = paramStart > 0 ? args[(paramStart + 1)..].Trim() : "";
+        var (notify, orcpt) = DsnParser.ParseRcptToParams(parameters);
 
         // Check if this is a local or remote recipient
         var isLocalRecipient = config.IsLocalDomain(recipientDomain);
@@ -1167,17 +1242,25 @@ public sealed class SmtpSession(
             logger.Log(LogLevel.Debug, $"Submission port recipient (auth check deferred): {recipient}");
         }
 
+        // Store DSN info for this recipient
+        _recipientDsns.Add(new RecipientDsn
+        {
+            Recipient = recipient,
+            Notify = notify,
+            OriginalRecipient = orcpt
+        });
+
         _rcptTo.Add(recipient);
         _state = SmtpSessionState.RcptTo;
 
-        await SendResponseAsync(250, "OK");
+        await SendResponseAsync(250, "2.1.5 OK");
     }
 
     private async Task HandleDataAsync(CancellationToken ct)
     {
         if (_state < SmtpSessionState.RcptTo || _rcptTo.Count == 0)
         {
-            await SendResponseAsync(503, "Need RCPT command first");
+            await SendResponseAsync(503, "5.5.1 Need RCPT command first");
             return;
         }
 
@@ -1185,6 +1268,14 @@ public sealed class SmtpSession(
         if (isSubmissionPort && config.RequireAuthOnSubmission && !_authManager.IsAuthenticated)
         {
             await SendResponseAsync(530, "5.7.0 Authentication required");
+            return;
+        }
+        
+        // Check message rate limit
+        if (connectionTracker is not null && 
+            !connectionTracker.CanSendMessage(_clientIp, _authManager.IsAuthenticated))
+        {
+            await SendResponseAsync(452, "4.7.1 Too many messages, try again later");
             return;
         }
 
@@ -1209,7 +1300,7 @@ public sealed class SmtpSession(
             totalSize += line.Length + 2;
             if (totalSize > config.MaxMessageSize)
             {
-                await SendResponseAsync(552, "Message size exceeds maximum");
+                await SendResponseAsync(552, "5.3.4 Message size exceeds maximum");
                 ResetTransaction();
                 return;
             }
@@ -1218,14 +1309,24 @@ public sealed class SmtpSession(
         }
 
         var rawMessage = messageBuilder.ToString();
+        await ProcessReceivedMessageAsync(rawMessage, ct);
+    }
+
+    /// <summary>
+    /// Process a received message (from DATA or BDAT)
+    /// </summary>
+    private async Task ProcessReceivedMessageAsync(string rawMessage, CancellationToken ct)
+    {
         var message = EmailMessage.Parse(rawMessage);
 
         // Perform DNS verification (for inbound mail from other servers)
         var senderDomain = ExtractDomain(_mailFrom ?? "");
+        DnsVerificationResult? verification = null;
+        
         if (!string.IsNullOrEmpty(senderDomain) && !_authManager.IsAuthenticated)
         {
             // Only verify external mail (not from authenticated local users)
-            message.Verification = await dnsVerifier.VerifyAsync(
+            verification = await dnsVerifier.VerifyAsync(
                 senderDomain,
                 _clientIp,
                 _mailFrom ?? "",
@@ -1233,9 +1334,59 @@ public sealed class SmtpSession(
                 message,
                 ct
             );
+            message.Verification = verification;
 
-            LogVerificationResult(message.Verification);
+            LogVerificationResult(verification);
+
+            // === SPF HARD-FAIL REJECT ===
+            if (verification.Spf == SpfResult.Fail)
+            {
+                logger.Log(LogLevel.Warning, $"SPF hard-fail for {_mailFrom} from {_clientIp}");
+                await SendResponseAsync(550, $"5.7.23 SPF validation failed: {senderDomain} does not authorize {_clientIp}");
+                ResetTransaction();
+                return;
+            }
+
+            // === DKIM FAIL REJECT ===
+            if (verification.Dkim == DkimResult.Fail)
+            {
+                logger.Log(LogLevel.Warning, $"DKIM verification failed for message from {_mailFrom}");
+                await SendResponseAsync(550, "5.7.20 DKIM signature verification failed");
+                ResetTransaction();
+                return;
+            }
+
+            // === DMARC POLICY ENFORCEMENT ===
+            if (verification.Dmarc == DmarcResult.Fail)
+            {
+                // Check DMARC policy
+                var dmarcPolicy = verification.DmarcPolicy?.ToLowerInvariant() ?? "none";
+                
+                switch (dmarcPolicy)
+                {
+                    case "reject":
+                        logger.Log(LogLevel.Warning, $"DMARC reject policy for {senderDomain}");
+                        await SendResponseAsync(550, $"5.7.1 DMARC policy violation: {senderDomain} has p=reject");
+                        ResetTransaction();
+                        return;
+                        
+                    case "quarantine":
+                        logger.Log(LogLevel.Warning, $"DMARC quarantine policy for {senderDomain} - marking as suspicious");
+                        message.Headers.Add(new KeyValuePair<string, string>("X-DMARC-Quarantine", "true"));
+                        break;
+                        
+                    case "none":
+                    default:
+                        // Log but deliver
+                        logger.Log(LogLevel.Info, $"DMARC failed but policy is {dmarcPolicy} for {senderDomain}");
+                        break;
+                }
+            }
         }
+
+        // Record message for rate limiting
+        connectionTracker?.RecordMessage(_clientIp);
+        _counters.Messages++;
 
         // Determine what to do with the message
         var hasLocalRecipients = _localRcptTo.Count > 0;
@@ -1284,7 +1435,8 @@ public sealed class SmtpSession(
                     MessageContent = rawMessage,
                     TargetDomain = domainGroup.Key,
                     QueuedAt = DateTime.UtcNow,
-                    NextRetry = DateTime.UtcNow
+                    NextRetry = DateTime.UtcNow,
+                    RequireTls = _requireTls   // Propagate REQUIRETLS (RFC 8689)
                 };
 
                 await mailQueue.EnqueueAsync(queuedMail, ct);
@@ -1299,8 +1451,91 @@ public sealed class SmtpSession(
             logger.Log(LogLevel.Debug, "Outbound-only message (not stored locally)");
         }
 
-        await SendResponseAsync(250, $"OK: Message accepted for delivery");
+        await SendResponseAsync(250, "2.0.0 OK: Message accepted for delivery");
         ResetTransaction();
+    }
+
+    /// <summary>
+    /// Handle BDAT command (RFC 3030 CHUNKING)
+    /// BDAT allows sending message data in chunks without dot-stuffing
+    /// </summary>
+    private async Task HandleBdatAsync(string args, CancellationToken ct)
+    {
+        if (_state < SmtpSessionState.RcptTo || _rcptTo.Count == 0)
+        {
+            await SendResponseAsync(503, "5.5.1 Need RCPT command first");
+            return;
+        }
+
+        // Parse BDAT arguments: BDAT <size> [LAST]
+        var parts = args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 1 || !int.TryParse(parts[0], out var chunkSize))
+        {
+            await SendResponseAsync(501, "5.5.4 Syntax: BDAT size [LAST]");
+            return;
+        }
+
+        var isLast = parts.Length > 1 && parts[1].Equals("LAST", StringComparison.OrdinalIgnoreCase);
+
+        // Validate chunk size
+        if (chunkSize < 0)
+        {
+            await SendResponseAsync(501, "5.5.4 Invalid chunk size");
+            return;
+        }
+
+        if (_bdatBuffer.Length + chunkSize > config.MaxMessageSize)
+        {
+            await SendResponseAsync(552, "5.3.4 Message size exceeds maximum");
+            ResetTransaction();
+            return;
+        }
+
+        // Check message rate limit on first chunk
+        if (!_inBdatSequence)
+        {
+            if (connectionTracker is not null && 
+                !connectionTracker.CanSendMessage(_clientIp, _authManager.IsAuthenticated))
+            {
+                await SendResponseAsync(452, "4.7.1 Too many messages, try again later");
+                return;
+            }
+            _inBdatSequence = true;
+        }
+
+        // Read exact number of bytes
+        var buffer = new byte[chunkSize];
+        var bytesRead = 0;
+        
+        while (bytesRead < chunkSize)
+        {
+            var read = await _stream.ReadAsync(buffer.AsMemory(bytesRead, chunkSize - bytesRead), ct);
+            if (read == 0)
+            {
+                await SendResponseAsync(451, "4.3.0 Connection lost during BDAT");
+                ResetTransaction();
+                return;
+            }
+            bytesRead += read;
+        }
+
+        // Append to buffer
+        _bdatBuffer.Write(buffer, 0, chunkSize);
+
+        if (isLast)
+        {
+            // Process the complete message
+            var rawMessage = Encoding.UTF8.GetString(_bdatBuffer.ToArray());
+            _bdatBuffer.SetLength(0);
+            _inBdatSequence = false;
+            
+            await ProcessReceivedMessageAsync(rawMessage, ct);
+        }
+        else
+        {
+            // More chunks expected
+            await SendResponseAsync(250, $"2.0.0 {chunkSize} bytes received, continue");
+        }
     }
 
     private void LogVerificationResult(DnsVerificationResult v)
@@ -1334,6 +1569,12 @@ public sealed class SmtpSession(
         _rcptTo.Clear();
         _localRcptTo.Clear();
         _remoteRcptTo.Clear();
+        _recipientDsns.Clear();
+        _dsnEnvId = null;
+        _dsnRet = DsnRet.Full;
+        _requireTls = false;
+        _inBdatSequence = false;
+        _bdatBuffer.SetLength(0);
         _state = SmtpSessionState.Greeted;
     }
 
@@ -1381,24 +1622,33 @@ public sealed class SmtpSession(
 public sealed class SmtpServer : IAsyncDisposable
 {
     private readonly SmtpServerConfig               _config;
+    private readonly RateLimitConfig                _rateLimitConfig;
     private readonly IMailStorage                   _storage;
     private readonly DnsVerifier                    _dnsVerifier;
     private readonly IUserStore                     _userStore;
     private readonly IMailQueue?                    _mailQueue;
+    private readonly ConnectionTracker              _connectionTracker;
     private readonly X509Certificate2?              _certificate;
     private readonly ILogger                        _logger;
     private readonly ConcurrentBag<TcpListener>     _listeners = [];
     private readonly ConcurrentBag<Task>            _sessionTasks = [];
     private readonly CancellationTokenSource        _cts = new();
 
-    public SmtpServer(SmtpServerConfig config, ILogger? logger = null, IUserStore? userStore = null, IMailQueue? mailQueue = null)
+    public SmtpServer(
+        SmtpServerConfig    config, 
+        ILogger?            logger = null, 
+        IUserStore?         userStore = null, 
+        IMailQueue?         mailQueue = null,
+        RateLimitConfig?    rateLimitConfig = null)
     {
         _config = config;
+        _rateLimitConfig = rateLimitConfig ?? new RateLimitConfig();
         _logger = logger ?? new ConsoleLogger();
         _storage = new FileMailStorage(config.MailStoragePath, _logger);
         _dnsVerifier = new DnsVerifier(_logger);
         _userStore = userStore ?? new FileUserStore(Path.Combine(config.MailStoragePath, "users.txt"));
         _mailQueue = mailQueue;
+        _connectionTracker = new ConnectionTracker(_rateLimitConfig, _logger);
 
         if (config.CertificatePath is not null)
         {
@@ -1419,6 +1669,7 @@ public sealed class SmtpServer : IAsyncDisposable
         _logger.Log(LogLevel.Info, $"Local domains: {string.Join(", ", _config.LocalDomains)}");
         _logger.Log(LogLevel.Info, $"Relay auth required: {_config.RequireAuthForRelay}");
         _logger.Log(LogLevel.Info, $"Verification: SPF={_config.VerifySpf} DKIM={_config.VerifyDkim} DMARC={_config.VerifyDmarc}");
+        _logger.Log(LogLevel.Info, $"Rate limiting: {_rateLimitConfig.MaxConnectionsPerIp} conn/IP, {_rateLimitConfig.MaxAuthAttemptsPerIpPerHour} auth/hr");
 
         Directory.CreateDirectory(_config.MailStoragePath);
 
@@ -1457,11 +1708,46 @@ public sealed class SmtpServer : IAsyncDisposable
             {
                 var client = await listener.AcceptTcpClientAsync(ct);
                 var endpoint = client.Client.RemoteEndPoint as IPEndPoint;
-                _logger.Log(LogLevel.Info, $"[{portType}] Connection from {endpoint?.Address}:{endpoint?.Port}");
+                
+                if (endpoint is null)
+                {
+                    client.Close();
+                    continue;
+                }
+
+                // Check rate limiting
+                var rateLimitResult = _connectionTracker.CanConnect(endpoint.Address);
+                if (rateLimitResult != RateLimitResult.Allowed)
+                {
+                    _logger.Log(LogLevel.Warning, 
+                        $"[{portType}] Connection rejected from {endpoint.Address}: {rateLimitResult}");
+                    
+                    // Send rejection message and close
+                    try
+                    {
+                        var writer = new StreamWriter(client.GetStream()) { AutoFlush = true };
+                        var message = rateLimitResult switch
+                        {
+                            RateLimitResult.Blacklisted => "554 5.7.1 Connection refused - blacklisted",
+                            RateLimitResult.TooManyConnections => "421 4.7.0 Too many connections, try again later",
+                            RateLimitResult.TooManyConnectionsPerIp => "421 4.7.0 Too many connections from your IP",
+                            RateLimitResult.ConnectionRateExceeded => "421 4.7.0 Connection rate exceeded, slow down",
+                            _ => "421 4.7.0 Connection rejected"
+                        };
+                        await writer.WriteLineAsync(message);
+                    }
+                    catch { /* ignore */ }
+                    
+                    client.Close();
+                    continue;
+                }
+
+                _logger.Log(LogLevel.Info, $"[{portType}] Connection from {endpoint.Address}:{endpoint.Port}");
 
                 var session = new SmtpSession(
                     client, _config, _storage, _dnsVerifier, _certificate, 
-                    _userStore, _mailQueue, isSubmissionPort, _logger
+                    _userStore, _mailQueue, isSubmissionPort, 
+                    _connectionTracker, _rateLimitConfig, _logger
                 );
                 var task = session.HandleAsync(ct);
                 _sessionTasks.Add(task);
@@ -1488,6 +1774,7 @@ public sealed class SmtpServer : IAsyncDisposable
         }
 
         await Task.WhenAll(_sessionTasks.ToArray());
+        _connectionTracker.Dispose();
         _logger.Log(LogLevel.Info, "Server stopped");
     }
 

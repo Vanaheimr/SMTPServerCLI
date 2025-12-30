@@ -27,8 +27,8 @@ using org.GraphDefined.Vanaheimr.Hermod.SMTP.New;
 
 
 // Generate self-signed certificate for testing if not exists
-var certPath     = Path.Combine(AppContext.BaseDirectory, "server.pfx");
-var certPassword = "smtp-test-password";
+var certPath      = Path.Combine(AppContext.BaseDirectory, "server.pfx");
+var certPassword  = "smtp-test-password";
 
 if (!File.Exists(certPath))
 {
@@ -67,6 +67,17 @@ var smtpServerConfig  = new SMTPServerConfig {
                         };
 
 var logger = new ConsoleLogger();
+
+// Rate limiting configuration
+var rateLimitConfig = new RateLimitConfig {
+                          MaxTotalConnections           = 100,
+                          MaxConnectionsPerIp           = 10,
+                          MaxConnectionsPerIpPerMinute  = 30,
+                          MaxAuthAttemptsPerIpPerHour   = 10,
+                          MaxMessagesPerIpPerHour       = 50,
+                          MaxInvalidCommands            = 5,
+                          AuthFailDelayMs               = 3000
+                      };
 
 // Setup DKIM signer (optional)
 DkimSigner? dkimSigner = null;
@@ -119,7 +130,7 @@ var outboundConfig = new SmtpOutboundConfig {
     SmartHostPassword  =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST_PASS")
 };
 
-var outboundClient = new SmtpOutboundClient(outboundConfig, dkimSigner, logger);
+var outboundClient = new SMTPOutboundClient(outboundConfig, dkimSigner, logger);
 
 // Setup bounce handler
 var bounceHandler = new BounceHandler(smtpServerConfig, mailQueue, logger);
@@ -211,7 +222,7 @@ finally
 static void GenerateSelfSignedCertificate(String path, String password, String hostname)
 {
 
-    using var rsa = RSA.Create(2048);
+    using var rsa = RSA.Create(4096);
 
     var request = new CertificateRequest(
         $"CN={hostname}",

@@ -52,6 +52,18 @@
 
 //var logger = new ConsoleLogger();
 
+//// Rate limiting configuration
+//var rateLimitConfig = new RateLimitConfig
+//{
+//    MaxTotalConnections = 100,
+//    MaxConnectionsPerIp = 10,
+//    MaxConnectionsPerIpPerMinute = 30,
+//    MaxAuthAttemptsPerIpPerHour = 10,
+//    MaxMessagesPerIpPerHour = 50,
+//    MaxInvalidCommands = 5,
+//    AuthFailDelayMs = 3000
+//};
+
 //// Setup DKIM signer (optional)
 //DkimSigner? dkimSigner = null;
 //var dkimKeyPath = Path.Combine(mailStoragePath, "dkim_default.private.pem");
@@ -146,7 +158,7 @@
 //}
 
 //// Create and start server
-//await using var server = new SmtpServer(config, logger, mailQueue: mailQueue);
+//await using var server = new SmtpServer(config, logger, mailQueue: mailQueue, rateLimitConfig: rateLimitConfig);
 
 //// Handle shutdown
 //var cts = new CancellationTokenSource();

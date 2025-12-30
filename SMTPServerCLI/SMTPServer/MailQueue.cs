@@ -38,19 +38,21 @@ public enum QueueItemStatus
 
 public sealed class QueuedMail
 {
-    public required string   Id              { get; init; }
-    public required string   EnvelopeFrom    { get; init; }
-    public required string[] EnvelopeTo      { get; init; }
-    public required string   MessageContent  { get; init; }
-    public required string   TargetDomain    { get; init; }
-    public DateTime          QueuedAt        { get; init; } = DateTime.UtcNow;
-    public DateTime          NextRetry       { get; set; }  = DateTime.UtcNow;
-    public int               RetryCount      { get; set; }  = 0;
-    public string?           LastError       { get; set; }
-    public QueueItemStatus   Status          { get; set; }  = QueueItemStatus.Pending;
-    public DateTime?         DeliveredAt     { get; set; }
-    public string?           RemoteMx        { get; set; }
-    public string?           RemoteResponse  { get; set; }
+    public required String    Id                { get; init; }
+    public required String    EnvelopeFrom      { get; init; }
+    public required String[]  EnvelopeTo        { get; init; }
+    public required String    MessageContent    { get; init; }
+    public required String    TargetDomain      { get; init; }
+    public DateTime           QueuedAt          { get; init; } = DateTime.UtcNow;
+    public DateTime           NextRetry         { get; set;  }  = DateTime.UtcNow;
+    public UInt16             RetryCount        { get; set;  }  = 0;
+    public String?            LastError         { get; set;  }
+    public QueueItemStatus    Status            { get; set;  }  = QueueItemStatus.Pending;
+    public DateTime?          DeliveredAt       { get; set;  }
+    public String?            RemoteMx          { get; set;  }
+    public String?            RemoteResponse    { get; set;  }
+    public Boolean            RequireTls        { get; init; } = false;  // RFC 8689
+
 }
 
 #endregion
@@ -426,6 +428,7 @@ public sealed class FileMailQueue : IMailQueue, IDisposable
 
 public static class RetryCalculator
 {
+
     // RFC 5321 recommends: retry for at least 4-5 days
     // Typical schedule: 15m, 30m, 1h, 2h, 4h, 8h, 12h, then every 24h
     private static readonly TimeSpan[] RetryIntervals =
@@ -444,25 +447,28 @@ public static class RetryCalculator
         TimeSpan.FromHours(24),
     ];
 
-    public const int MaxRetries = 12; // ~5 days total
+    public const UInt16 MaxRetries = 12; // ~5 days total
     public static readonly TimeSpan MaxQueueTime = TimeSpan.FromDays(5);
 
-    public static DateTime GetNextRetryTime(int retryCount)
+    public static DateTime GetNextRetryTime(UInt16 retryCount)
     {
+
         var index = Math.Min(retryCount, RetryIntervals.Length - 1);
         var interval = RetryIntervals[index];
-        
+
         // Add some jitter (±10%) to prevent thundering herd
         var jitter = interval.TotalSeconds * (Random.Shared.NextDouble() * 0.2 - 0.1);
-        
+
         return DateTime.UtcNow.Add(interval).AddSeconds(jitter);
+
     }
 
-    public static bool ShouldGiveUp(QueuedMail mail)
+    public static Boolean ShouldGiveUp(QueuedMail mail)
     {
         return mail.RetryCount >= MaxRetries ||
                DateTime.UtcNow - mail.QueuedAt > MaxQueueTime;
     }
+
 }
 
 #endregion

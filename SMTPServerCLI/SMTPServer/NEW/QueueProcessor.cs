@@ -240,6 +240,7 @@ public sealed class QueueProcessor : IAsyncDisposable
                 mail.EnvelopeFrom,
                 mail.EnvelopeTo,
                 mail.MessageContent,
+                mail.RequireTls,
                 ct
             );
 

@@ -8,18 +8,30 @@ Ein vollständiger SMTP-Server in C# .NET 10 mit StartTLS, SMTP-AUTH, DKIM, DNS-
 - **SMTP-Protokoll**: Vollständige Implementierung nach RFC 5321
 - **STARTTLS**: TLS 1.2 und TLS 1.3 Unterstützung
 - **SMTP-AUTH**: PLAIN, LOGIN, SCRAM-SHA-256, EXTERNAL (mTLS)
+- **CHUNKING/BDAT**: RFC 3030 - große Nachrichten ohne Dot-Stuffing
+- **DSN**: RFC 3461/3464 - Delivery Status Notifications
+- **REQUIRETLS**: RFC 8689 - TLS-Pflicht für sensible Mails
 - **DKIM-Verifizierung**: Überprüfung von DKIM-Signaturen
 - **SPF-Validierung**: Sender Policy Framework Prüfung
-- **DMARC-Analyse**: Domain-based Message Authentication
+- **DMARC-Enforcement**: Policy-basierte Ablehnung/Quarantäne
 - **Dateispeicherung**: E-Mails werden als .eml-Dateien gespeichert
 
 ### Ausgehend (Outbound)
 - **Mail Queue**: Persistente Warteschlange mit Retry-Logik
 - **MX Lookup**: Automatische DNS-Auflösung für Ziel-Domains
 - **DKIM Signing**: Ausgehende E-Mails signieren
+- **MTA-STS**: RFC 8461 - Strict Transport Security
 - **Smarthost**: Optionale Relay-Unterstützung
 - **Bounce Handling**: NDRs (Non-Delivery Reports) generieren
 - **Rate Limiting**: Pro-Domain Throttling
+
+### Sicherheit
+- **Rate Limiting**: Schutz vor Brute-Force und DoS
+- **Connection Limits**: Max. Verbindungen pro IP
+- **SPF Hard-Fail Reject**: Strikte SPF-Durchsetzung
+- **DKIM Fail Reject**: Ungültige Signaturen ablehnen
+- **DMARC Policy Enforcement**: p=reject wird durchgesetzt
+- **IP Blacklist/Whitelist**: Manuelle Zugriffskontrolle
 
 ## Architektur
 

@@ -11,14 +11,15 @@ using org.GraphDefined.Vanaheimr.Illias;
 
 Console.WriteLine("SMTP Server Test Client\n");
 
-var host = args.Length > 0                                     ? args[0] : "localhost";
-var port = args.Length > 1 && int.TryParse(args[1], out var p) ? p       : 2525;
+var host = args.Length > 0                                        ? args[0] : "localhost";
+var port = args.Length > 1 && UInt16.TryParse(args[1], out var p) ? p       : (UInt16) 2525;
 
 Console.WriteLine($"Connecting to {host}:{port}...\n");
 //await TestWithoutTlsAsync(host, port);
 
 Console.WriteLine("\n" + new String('─', 60) + "\n");
-await TestWithStartTlsAndAuthPlainAsync(host, port);
+//await TestWithStartTlsAndAuthPlain_DATA(host, port);
+await TestWithStartTlsAndAuthPlain_BDAT(host, port);
 
 //Console.WriteLine("\n" + new String('─', 60) + "\n");
 //await TestWithAuthLoginAsync(host, port);
@@ -26,7 +27,7 @@ await TestWithStartTlsAndAuthPlainAsync(host, port);
 //Console.WriteLine("\n" + new String('─', 60) + "\n");
 //await TestWithAuthScramAsync(host, port);
 
-static async Task TestWithoutTlsAsync(string host, int port)
+static async Task TestWithoutTlsAsync(String host, UInt16 port)
 {
 
     Console.WriteLine("═══ Test 1: Plain SMTP (no TLS, no AUTH) ═══\n");
@@ -77,7 +78,7 @@ static async Task TestWithoutTlsAsync(string host, int port)
 
 }
 
-static async Task TestWithStartTlsAndAuthPlainAsync(string host, int port)
+static async Task TestWithStartTlsAndAuthPlain_DATA(String host, UInt16 port)
 {
 
     Console.WriteLine("═══ Test 2: STARTTLS + AUTH PLAIN ═══\n");
@@ -161,10 +162,139 @@ static async Task TestWithStartTlsAndAuthPlainAsync(string host, int port)
     }
 }
 
-static async Task TestWithAuthLoginAsync(string host, int port)
+static async Task TestWithStartTlsAndAuthPlain_BDAT(String host, UInt16 port)
 {
 
-    Console.WriteLine("═══ Test 3: STARTTLS + AUTH LOGIN ═══\n");
+    Console.WriteLine("═══ Test 3: STARTTLS + AUTH PLAIN + BDAT (CHUNKING) ═══\n");
+
+    using var client = new TcpClient();
+    await client.ConnectAsync(host, port);
+
+    Stream stream = client.GetStream();
+    StreamReader reader = new(stream, Encoding.ASCII);
+    StreamWriter writer = new(stream, Encoding.ASCII) { AutoFlush = true };
+
+    await ReadResponseAsync(reader);
+    await SendCommandAsync(writer, reader, "EHLO testclient.local");
+
+    // STARTTLS
+    Console.WriteLine("C: STARTTLS");
+    await writer.WriteLineAsync("STARTTLS");
+    var response = await reader.ReadLineAsync();
+    Console.WriteLine($"S: {response}");
+
+    if (response?.StartsWith("220") == true)
+    {
+
+        Console.WriteLine("\n→ Upgrading to TLS...\n");
+
+        var sslStream = new SslStream(stream, false, (_, _, _, _) => true);
+        await sslStream.AuthenticateAsClientAsync(host);
+
+        Console.WriteLine($"TLS: {sslStream.SslProtocol}, {sslStream.CipherAlgorithm}\n");
+
+        stream = sslStream;
+        reader = new StreamReader(sslStream, Encoding.ASCII);
+        writer = new StreamWriter(sslStream, Encoding.ASCII) { AutoFlush = true };
+
+        await SendCommandAsync(writer, reader, "EHLO testclient.local");
+
+        // AUTH PLAIN (credentials: admin:test123)
+        var authString = "\0admin\0test123";
+        var authBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(authString));
+
+        Console.WriteLine($"→ Authenticating with AUTH PLAIN...\n");
+        await SendCommandAsync(writer, reader, $"AUTH PLAIN {authBase64}");
+
+        // Send email as authenticated user
+        await SendCommandAsync(writer, reader, "MAIL FROM:<admin@localhost>");
+        await SendCommandAsync(writer, reader, "RCPT TO:<recipient@localhost>");
+
+        //  From: Admin <admin@localhost>
+        //  To: Recipient <recipient@localhost>
+        //  Subject: Test Email (BDAT/CHUNKING)
+        //  Date: Mon, 30 Dec 2024 10:00:00 +0000
+        //  Message-ID: <test-bdat@localhost>
+        //  MIME-Version: 1.0
+        //  Content-Type: text/plain; charset=utf-8
+        //  
+        //  This email was sent using BDAT (CHUNKING) instead of DATA.
+        //  
+        //  BDAT allows sending binary data without dot-stuffing.
+        //  It's defined in RFC 3030.
+        //  
+        //  Benefits:
+        //  - No need for dot-stuffing (escaping lines starting with ".")
+        //  - Binary-safe transmission
+        //  - Can send in multiple chunks
+        var emailBuilder  = new TextEMailBuilder {
+
+                                From       = new EMailAddress("Admin", SimpleEMailAddress.Parse("admin@localhost")),
+                                To         = EMailAddressList.Create(
+                                                 new EMailAddress(
+                                                     "Recipient",
+                                                     SimpleEMailAddress.Parse("recipient@localhost")
+                                                 )
+                                             ),
+                                Subject    = "Test Email (TLS + AUTH PLAIN)",
+                                Date       = Timestamp.Now,
+                                MessageId  = Message_Id.Parse("test-authplain@localhost"),
+
+                                Text       = "This email was sent using BDAT (CHUNKING) instead of DATA." + Environment.NewLine + Environment.NewLine +
+                                             "BDAT allows sending binary data without dot-stuffing." + Environment.NewLine +
+                                             "It's defined in RFC 3030." + Environment.NewLine + Environment.NewLine +
+                                             "Benefits:" + Environment.NewLine +
+                                             "- No need for dot-stuffing (escaping lines starting with \".\")" + Environment.NewLine +
+                                             "- Binary-safe transmission" + Environment.NewLine +
+                                             "- Can send in multiple chunks"
+
+                            };
+
+        var message       = emailBuilder.AsImmutable.ToString();
+        var messageBytes  = Encoding.UTF8.GetBytes(message);
+
+        // Send message in two chunks to demonstrate chunking
+        var chunk1Size = messageBytes.Length / 2;
+        var chunk2Size = messageBytes.Length - chunk1Size;
+
+        // First chunk (not LAST)
+        Console.WriteLine($"C: BDAT {chunk1Size}");
+        await writer.WriteLineAsync($"BDAT {chunk1Size}");
+        await writer.FlushAsync();
+
+        // Write raw bytes for first chunk
+        await stream.WriteAsync(messageBytes.AsMemory(0, chunk1Size));
+        await stream.FlushAsync();
+
+        response = await reader.ReadLineAsync();
+        Console.WriteLine($"S: {response}");
+
+        // Second chunk (LAST)
+        Console.WriteLine($"C: BDAT {chunk2Size} LAST");
+        await writer.WriteLineAsync($"BDAT {chunk2Size} LAST");
+        await writer.FlushAsync();
+
+        // Write raw bytes for second chunk
+        await stream.WriteAsync(messageBytes.AsMemory(chunk1Size, chunk2Size));
+        await stream.FlushAsync();
+
+        response = await reader.ReadLineAsync();
+        Console.WriteLine($"S: {response}");
+
+        await SendCommandAsync(writer, reader, "QUIT");
+
+        Console.WriteLine("✓ BDAT (CHUNKING) test completed");
+
+    }
+}
+
+
+
+
+static async Task TestWithAuthLoginAsync(String host, UInt16 port)
+{
+
+    Console.WriteLine("═══ Test 4: STARTTLS + AUTH LOGIN ═══\n");
 
     using var client = new TcpClient();
     await client.ConnectAsync(host, port);
@@ -221,10 +351,10 @@ static async Task TestWithAuthLoginAsync(string host, int port)
 
 }
 
-static async Task TestWithAuthScramAsync(string host, int port)
+static async Task TestWithAuthScramAsync(String host, UInt16 port)
 {
 
-    Console.WriteLine("═══ Test 4: AUTH SCRAM-SHA-256 (no TLS required) ═══\n");
+    Console.WriteLine("═══ Test 5: AUTH SCRAM-SHA-256 (no TLS required) ═══\n");
 
     using var client = new TcpClient();
     await client.ConnectAsync(host, port);
@@ -322,7 +452,7 @@ static async Task TestWithAuthScramAsync(string host, int port)
 
 
 
-static Dictionary<String, String> ParseScramMessage(string message)
+static Dictionary<String, String> ParseScramMessage(String message)
 {
     var result = new Dictionary<string, string>();
     foreach (var part in message.Split(','))
@@ -334,7 +464,7 @@ static Dictionary<String, String> ParseScramMessage(string message)
     return result;
 }
 
-static async Task SendCommandAsync(StreamWriter writer, StreamReader reader, string command)
+static async Task SendCommandAsync(StreamWriter writer, StreamReader reader, String command)
 {
     Console.WriteLine($"C: {command}");
     await writer.WriteLineAsync(command);

@@ -72,16 +72,30 @@ public sealed record SmtpOutboundConfig
 
 #region SMTP Outbound Client
 
-public sealed partial class SmtpOutboundClient(
-    SmtpOutboundConfig  config,
-    DkimSigner?         dkimSigner,
-    ILogger             logger)
+public sealed partial class SmtpOutboundClient
 {
+    private readonly SmtpOutboundConfig _config;
+    private readonly DkimSigner? _dkimSigner;
+    private readonly MtaStsResolver _mtaStsResolver;
+    private readonly ILogger _logger;
+
+    public SmtpOutboundClient(
+        SmtpOutboundConfig  config,
+        DkimSigner?         _dkimSigner,
+        ILogger             logger)
+    {
+        _config = config;
+        _dkimSigner = _dkimSigner;
+        _logger = logger;
+        _mtaStsResolver = new MtaStsResolver(logger);
+    }
+
     public async Task<SendResult> SendAsync(
         string              targetDomain,
         string              envelopeFrom,
         string[]            recipients,
         string              messageContent,
+        bool                requireTls = false,
         CancellationToken   ct = default)
     {
         var startTime = DateTime.UtcNow;
@@ -89,19 +103,30 @@ public sealed partial class SmtpOutboundClient(
         try
         {
             // Sign message with DKIM if signer is configured
-            if (dkimSigner is not null)
+            if (_dkimSigner is not null)
             {
-                messageContent = dkimSigner.SignMessage(messageContent);
+                messageContent = _dkimSigner.SignMessage(messageContent);
+            }
+
+            // Check MTA-STS policy
+            var mtaStsPolicy = await _mtaStsResolver.GetPolicyAsync(targetDomain, ct);
+            var enforceTls = requireTls || 
+                             mtaStsPolicy.Mode == MtaStsMode.Enforce ||
+                             _config.RequireStartTls;
+
+            if (mtaStsPolicy.Mode != MtaStsMode.None)
+            {
+                _logger.Log(LogLevel.Info, $"MTA-STS policy for {targetDomain}: {mtaStsPolicy.Mode}");
             }
 
             // Determine target hosts
             IReadOnlyList<MxRecord> mxHosts;
             
-            if (config.SmartHost is not null)
+            if (_config.SmartHost is not null)
             {
                 // Use smarthost relay
-                mxHosts = [new MxRecord(config.SmartHost, 0)];
-                logger.Log(LogLevel.Debug, $"Using smarthost: {config.SmartHost}");
+                mxHosts = [new MxRecord(_config.SmartHost, 0)];
+                _logger.Log(LogLevel.Debug, $"Using smarthost: {_config.SmartHost}");
             }
             else
             {
@@ -112,7 +137,19 @@ public sealed partial class SmtpOutboundClient(
                     // Fallback to A/AAAA record
                     mxHosts = [new MxRecord(targetDomain, 0)];
                 }
-                logger.Log(LogLevel.Debug, $"MX records for {targetDomain}: {string.Join(", ", mxHosts.Select(m => $"{m.Host}:{m.Priority}"))}");
+                _logger.Log(LogLevel.Debug, $"MX records for {targetDomain}: {string.Join(", ", mxHosts.Select(m => $"{m.Host}:{m.Priority}"))}");
+
+                // If MTA-STS is in enforce mode, filter MX hosts to match policy
+                if (mtaStsPolicy.Mode == MtaStsMode.Enforce && mtaStsPolicy.MxPatterns.Count > 0)
+                {
+                    var filteredHosts = mxHosts.Where(mx => mtaStsPolicy.MatchesMx(mx.Host)).ToList();
+                    if (filteredHosts.Count == 0)
+                    {
+                        _logger.Log(LogLevel.Error, $"No MX hosts match MTA-STS policy for {targetDomain}");
+                        return SendResult.PermFail(550, "MTA-STS policy violation: no matching MX hosts");
+                    }
+                    mxHosts = filteredHosts;
+                }
             }
 
             // Try each MX host in priority order
@@ -126,10 +163,11 @@ public sealed partial class SmtpOutboundClient(
                 {
                     var result = await TrySendToMxAsync(
                         mx.Host,
-                        config.SmartHost is not null ? config.SmartHostPort : 25,
+                        _config.SmartHost is not null ? _config.SmartHostPort : 25,
                         envelopeFrom,
                         recipients,
                         messageContent,
+                        enforceTls,
                         ct
                     );
 
@@ -148,12 +186,12 @@ public sealed partial class SmtpOutboundClient(
                     // Temp failure - try next MX
                     lastError = result.ResponseText;
                     lastCode = result.ResponseCode;
-                    logger.Log(LogLevel.Warning, $"MX {mx.Host} temp failed: {result.ResponseCode} {result.ResponseText}");
+                    _logger.Log(LogLevel.Warning, $"MX {mx.Host} temp failed: {result.ResponseCode} {result.ResponseText}");
                 }
                 catch (Exception ex)
                 {
                     lastException = ex;
-                    logger.Log(LogLevel.Warning, $"MX {mx.Host} connection failed: {ex.Message}");
+                    _logger.Log(LogLevel.Warning, $"MX {mx.Host} connection failed: {ex.Message}");
                 }
             }
 
@@ -164,7 +202,7 @@ public sealed partial class SmtpOutboundClient(
         }
         catch (Exception ex)
         {
-            logger.Log(LogLevel.Error, $"Send failed to {targetDomain}: {ex.Message}");
+            _logger.Log(LogLevel.Error, $"Send failed to {targetDomain}: {ex.Message}");
             return SendResult.TempFail($"Send error: {ex.Message}");
         }
     }
@@ -175,17 +213,18 @@ public sealed partial class SmtpOutboundClient(
         string              envelopeFrom,
         string[]            recipients,
         string              messageContent,
+        bool                enforceTls,
         CancellationToken   ct)
     {
         using var client = new TcpClient();
-        client.SendTimeout = config.WriteTimeoutMs;
-        client.ReceiveTimeout = config.ReadTimeoutMs;
+        client.SendTimeout = _config.WriteTimeoutMs;
+        client.ReceiveTimeout = _config.ReadTimeoutMs;
 
         // Connect with timeout
         using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        connectCts.CancelAfter(config.ConnectTimeoutMs);
+        connectCts.CancelAfter(_config.ConnectTimeoutMs);
 
-        logger.Log(LogLevel.Debug, $"Connecting to {mxHost}:{port}");
+        _logger.Log(LogLevel.Debug, $"Connecting to {mxHost}:{port}");
         await client.ConnectAsync(mxHost, port, connectCts.Token);
 
         Stream stream = client.GetStream();
@@ -202,13 +241,13 @@ public sealed partial class SmtpOutboundClient(
             }
 
             // EHLO
-            await writer.WriteLineAsync($"EHLO {config.LocalHostname}");
+            await writer.WriteLineAsync($"EHLO {_config.LocalHostname}");
             var ehloResponse = await ReadMultilineResponseAsync(reader, ct);
             
             if (!ehloResponse.Code.StartsWith("250"))
             {
                 // Try HELO fallback
-                await writer.WriteLineAsync($"HELO {config.LocalHostname}");
+                await writer.WriteLineAsync($"HELO {_config.LocalHostname}");
                 ehloResponse = await ReadMultilineResponseAsync(reader, ct);
                 
                 if (!ehloResponse.Code.StartsWith("250"))
@@ -217,11 +256,13 @@ public sealed partial class SmtpOutboundClient(
                 }
             }
 
-            // STARTTLS if available and desired
+            // STARTTLS if available and desired/required
             var supportsStartTls = ehloResponse.Lines.Any(l => 
                 l.Contains("STARTTLS", StringComparison.OrdinalIgnoreCase));
 
-            if (supportsStartTls && (config.RequireStartTls || config.PreferStartTls))
+            var wantTls = enforceTls || _config.RequireStartTls || _config.PreferStartTls;
+            
+            if (supportsStartTls && wantTls)
             {
                 await writer.WriteLineAsync("STARTTLS");
                 var starttlsResponse = await ReadResponseAsync(reader, ct);
@@ -240,24 +281,24 @@ public sealed partial class SmtpOutboundClient(
                     reader = new StreamReader(sslStream, Encoding.ASCII);
                     writer = new StreamWriter(sslStream, Encoding.ASCII) { AutoFlush = true };
 
-                    logger.Log(LogLevel.Debug, $"TLS established with {mxHost}: {sslStream.SslProtocol}");
+                    _logger.Log(LogLevel.Debug, $"TLS established with {mxHost}: {sslStream.SslProtocol}");
 
                     // Re-send EHLO after TLS
-                    await writer.WriteLineAsync($"EHLO {config.LocalHostname}");
+                    await writer.WriteLineAsync($"EHLO {_config.LocalHostname}");
                     ehloResponse = await ReadMultilineResponseAsync(reader, ct);
                 }
-                else if (config.RequireStartTls)
+                else if (enforceTls || _config.RequireStartTls)
                 {
                     return SendResult.TempFail(454, $"STARTTLS required but failed: {starttlsResponse}", mxHost);
                 }
             }
-            else if (config.RequireStartTls)
+            else if (enforceTls || _config.RequireStartTls)
             {
-                return SendResult.TempFail(454, "STARTTLS required but not supported", mxHost);
+                return SendResult.TempFail(454, "STARTTLS required but not supported by remote", mxHost);
             }
 
             // AUTH if smarthost credentials provided
-            if (config.SmartHost is not null && config.SmartHostUsername is not null)
+            if (_config.SmartHost is not null && _config.SmartHostUsername is not null)
             {
                 var authResult = await AuthenticateAsync(reader, writer, ehloResponse, ct);
                 if (!authResult.StartsWith("235"))
@@ -287,7 +328,7 @@ public sealed partial class SmtpOutboundClient(
                 }
                 else
                 {
-                    logger.Log(LogLevel.Warning, $"Recipient {recipient} rejected: {rcptResponse}");
+                    _logger.Log(LogLevel.Warning, $"Recipient {recipient} rejected: {rcptResponse}");
                     // Continue with other recipients
                 }
             }
@@ -350,7 +391,7 @@ public sealed partial class SmtpOutboundClient(
         // Prefer PLAIN for simplicity (already over TLS)
         if (authLine.Contains("PLAIN", StringComparison.OrdinalIgnoreCase))
         {
-            var authString = $"\0{config.SmartHostUsername}\0{config.SmartHostPassword}";
+            var authString = $"\0{_config.SmartHostUsername}\0{_config.SmartHostPassword}";
             var authBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(authString));
             
             await writer.WriteLineAsync($"AUTH PLAIN {authBase64}");
@@ -365,12 +406,12 @@ public sealed partial class SmtpOutboundClient(
             if (!response.StartsWith("334"))
                 return response;
 
-            await writer.WriteLineAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(config.SmartHostUsername!)));
+            await writer.WriteLineAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(_config.SmartHostUsername!)));
             response = await ReadResponseAsync(reader, ct);
             if (!response.StartsWith("334"))
                 return response;
 
-            await writer.WriteLineAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(config.SmartHostPassword!)));
+            await writer.WriteLineAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(_config.SmartHostPassword!)));
             return await ReadResponseAsync(reader, ct);
         }
 
@@ -450,7 +491,7 @@ public sealed partial class SmtpOutboundClient(
         }
         catch (Exception ex)
         {
-            logger.Log(LogLevel.Warning, $"MX lookup failed for {domain}: {ex.Message}");
+            _logger.Log(LogLevel.Warning, $"MX lookup failed for {domain}: {ex.Message}");
             return [];
         }
     }
@@ -524,7 +565,7 @@ public sealed partial class SmtpOutboundClient(
         // For now, log issues but accept (many mail servers have cert issues)
         if (sslPolicyErrors != SslPolicyErrors.None)
         {
-            logger.Log(LogLevel.Warning, $"TLS certificate warning: {sslPolicyErrors}");
+            _logger.Log(LogLevel.Warning, $"TLS certificate warning: {sslPolicyErrors}");
         }
         return true; // Accept for now - mail delivery is more important than strict TLS
     }

@@ -33,11 +33,13 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
     {
 
         private readonly SMTPServerConfig            serverConfig;
+        private readonly RateLimitConfig             _rateLimitConfig;
         private readonly IMailStorage                _storage;
         private readonly DNSClient                   dnsClient;
         private readonly DNSVerifier                 _dnsVerifier;
         private readonly IUserStore                  _userStore;
         private readonly IMailQueue?                 _mailQueue;
+        private readonly ConnectionTracker           _connectionTracker;
         private readonly X509Certificate2?           _certificate;
         private readonly ILogger                     _logger;
         private readonly ConcurrentBag<TcpListener>  _listeners    = [];
@@ -46,18 +48,22 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         public SMTPServer(SMTPServerConfig  ServerConfig,
                           DNSClient         DNSClient,
-                          ILogger?          logger      = null,
-                          IUserStore?       userStore   = null,
-                          IMailQueue?       mailQueue   = null)
+                          ILogger?          logger            = null,
+                          IUserStore?       userStore         = null,
+                          IMailQueue?       mailQueue         = null,
+                          RateLimitConfig?  rateLimitConfig   = null)
+
         {
 
-            this.serverConfig  = ServerConfig;
-            this._logger       = logger ?? new ConsoleLogger();
-            this._storage      = new FileMailStorage(ServerConfig.MailStoragePath, _logger);
-            this.dnsClient     = DNSClient;
-            this._dnsVerifier  = new DNSVerifier(this.dnsClient, _logger);
-            this._userStore    = userStore ?? new FileUserStore(Path.Combine(ServerConfig.MailStoragePath, "users.txt"));
-            this._mailQueue    = mailQueue;
+            this.serverConfig        = ServerConfig;
+            this._rateLimitConfig    = rateLimitConfig ?? new RateLimitConfig();
+            this._logger             = logger          ?? new ConsoleLogger();
+            this._storage            = new FileMailStorage(ServerConfig.MailStoragePath, _logger);
+            this.dnsClient           = DNSClient;
+            this._dnsVerifier        = new DNSVerifier(this.dnsClient, _logger);
+            this._userStore          = userStore ?? new FileUserStore(Path.Combine(ServerConfig.MailStoragePath, "users.txt"));
+            this._mailQueue          = mailQueue;
+            this._connectionTracker  = new ConnectionTracker(_rateLimitConfig, _logger);
 
             if (ServerConfig.CertificatePath is not null)
             {
@@ -79,7 +85,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             _logger.Log(LogLevel.Info, $"Mail storage: {Path.GetFullPath(serverConfig.MailStoragePath)}");
             _logger.Log(LogLevel.Info, $"STARTTLS: {(_certificate is not null ? "Available" : "Not configured")}");
             _logger.Log(LogLevel.Info, $"AUTH mechanisms: PLAIN, LOGIN, SCRAM-SHA-256, EXTERNAL");
+            _logger.Log(LogLevel.Info, $"Local domains: {string.Join(", ", serverConfig.LocalDomains)}");
+            _logger.Log(LogLevel.Info, $"Relay auth required: {serverConfig.RequireAuthForRelay}");
             _logger.Log(LogLevel.Info, $"Verification: SPF={serverConfig.VerifySpf} DKIM={serverConfig.VerifyDkim} DMARC={serverConfig.VerifyDmarc}");
+            _logger.Log(LogLevel.Info, $"Rate limiting: {_rateLimitConfig.MaxConnectionsPerIp} conn/IP, {_rateLimitConfig.MaxAuthAttemptsPerIpPerHour} auth/hr");
 
             Directory.CreateDirectory(serverConfig.MailStoragePath);
 
@@ -125,7 +134,46 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                     var client    = await listener.AcceptTcpClientAsync(ct);
                     var endpoint  = client.Client.RemoteEndPoint as IPEndPoint;
-                    _logger.Log(LogLevel.Info, $"[{portType}] Connection from {endpoint?.Address}:{endpoint?.Port}");
+
+                    if (endpoint is null)
+                    {
+                        client.Close();
+                        continue;
+                    }
+
+                    // Check rate limiting
+                    var rateLimitResult = _connectionTracker.CanConnect(endpoint.Address);
+                    if (rateLimitResult != RateLimitResult.Allowed)
+                    {
+
+                        _logger.Log(LogLevel.Warning, 
+                            $"[{portType}] Connection rejected from {endpoint.Address}: {rateLimitResult}");
+
+                        // Send rejection message and close
+                        try
+                        {
+
+                            var writer = new StreamWriter(client.GetStream()) { AutoFlush = true };
+                            var message = rateLimitResult switch {
+                                RateLimitResult.Blacklisted              => "554 5.7.1 Connection refused - blacklisted",
+                                RateLimitResult.TooManyConnections       => "421 4.7.0 Too many connections, try again later",
+                                RateLimitResult.TooManyConnectionsPerIp  => "421 4.7.0 Too many connections from your IP",
+                                RateLimitResult.ConnectionRateExceeded   => "421 4.7.0 Connection rate exceeded, slow down",
+                                _                                        => "421 4.7.0 Connection rejected"
+                            };
+
+                            await writer.WriteLineAsync(message);
+
+                        }
+                        catch { /* ignore */ }
+
+                        client.Close();
+                        continue;
+
+                    }
+
+                    _logger.Log(LogLevel.Info, $"[{portType}] Connection from {endpoint.Address}:{endpoint.Port}");
+
 
                     var session   = new SMTPSession(
                                         client,
@@ -136,6 +184,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                         _userStore,
                                         _mailQueue,
                                         isSubmissionPort,
+                                        _connectionTracker,
+                                        _rateLimitConfig,
                                         _logger
                                     );
 
@@ -167,6 +217,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             }
 
             await Task.WhenAll(_sessionTasks.ToArray());
+            _connectionTracker.Dispose();
             _logger.Log(LogLevel.Info, "Server stopped");
 
         }
