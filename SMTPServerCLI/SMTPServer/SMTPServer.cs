@@ -1,0 +1,183 @@
+/*
+ * Copyright (c) 2010-2026 GraphDefined GmbH <achim.friedland@graphdefined.com>
+ * This file is part of Vanaheimr Hermod <https://www.github.com/Vanaheimr/Hermod>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#region Usings
+
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+
+using org.GraphDefined.Vanaheimr.Hermod.DNS;
+
+#endregion
+
+namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
+{
+
+    public sealed class SMTPServer : IAsyncDisposable
+    {
+
+        private readonly SMTPServerConfig            serverConfig;
+        private readonly IMailStorage                _storage;
+        private readonly DNSClient                   dnsClient;
+        private readonly DNSVerifier                 _dnsVerifier;
+        private readonly IUserStore                  _userStore;
+        private readonly IMailQueue?                 _mailQueue;
+        private readonly X509Certificate2?           _certificate;
+        private readonly ILogger                     _logger;
+        private readonly ConcurrentBag<TcpListener>  _listeners    = [];
+        private readonly ConcurrentBag<Task>         _sessionTasks = [];
+        private readonly CancellationTokenSource     _cts = new();
+
+        public SMTPServer(SMTPServerConfig  ServerConfig,
+                          DNSClient         DNSClient,
+                          ILogger?          logger      = null,
+                          IUserStore?       userStore   = null,
+                          IMailQueue?       mailQueue   = null)
+        {
+
+            this.serverConfig  = ServerConfig;
+            this._logger       = logger ?? new ConsoleLogger();
+            this._storage      = new FileMailStorage(ServerConfig.MailStoragePath, _logger);
+            this.dnsClient     = DNSClient;
+            this._dnsVerifier  = new DNSVerifier(this.dnsClient, _logger);
+            this._userStore    = userStore ?? new FileUserStore(Path.Combine(ServerConfig.MailStoragePath, "users.txt"));
+            this._mailQueue    = mailQueue;
+
+            if (ServerConfig.CertificatePath is not null)
+            {
+
+                _certificate = ServerConfig.CertificatePassword is not null
+                    ? X509CertificateLoader.LoadPkcs12FromFile     (ServerConfig.CertificatePath, ServerConfig.CertificatePassword)
+                    : X509CertificateLoader.LoadCertificateFromFile(ServerConfig.CertificatePath);
+
+                _logger.Log(LogLevel.Info, $"Loaded certificate: {_certificate.Subject}");
+
+            }
+
+        }
+
+        public async Task Start(CancellationToken ct = default)
+        {
+
+            _logger.Log(LogLevel.Info, $"Starting SMTP server on ports {serverConfig.Port} and {serverConfig.SubmissionPort}");
+            _logger.Log(LogLevel.Info, $"Mail storage: {Path.GetFullPath(serverConfig.MailStoragePath)}");
+            _logger.Log(LogLevel.Info, $"STARTTLS: {(_certificate is not null ? "Available" : "Not configured")}");
+            _logger.Log(LogLevel.Info, $"AUTH mechanisms: PLAIN, LOGIN, SCRAM-SHA-256, EXTERNAL");
+            _logger.Log(LogLevel.Info, $"Verification: SPF={serverConfig.VerifySpf} DKIM={serverConfig.VerifyDkim} DMARC={serverConfig.VerifyDmarc}");
+
+            Directory.CreateDirectory(serverConfig.MailStoragePath);
+
+            var listener25  = new TcpListener(System.Net.IPAddress.Any, serverConfig.Port);
+            var listener587 = new TcpListener(System.Net.IPAddress.Any, serverConfig.SubmissionPort);
+
+            listener25. Start();
+            listener587.Start();
+
+            _listeners.Add(listener25);
+            _listeners.Add(listener587);
+
+            _logger.Log(LogLevel.Info, "Server started. Waiting for connections...");
+
+            // Port 25:  MTA-to-MTA (inbound)
+            var task25   = AcceptConnections(listener25,  isSubmissionPort: false, _cts.Token);
+
+            // Port 587: MUA-to-MTA (submission)
+            var task587  = AcceptConnections(listener587, isSubmissionPort: true,  _cts.Token);
+
+            try
+            {
+                await Task.WhenAll(task25, task587);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _logger.Log(LogLevel.Info, "Server shutdown requested");
+            }
+
+        }
+
+        private async Task AcceptConnections(TcpListener        listener,
+                                             Boolean            isSubmissionPort,
+                                             CancellationToken  ct)
+        {
+
+            var portType = isSubmissionPort ? "Submission" : "MTA";
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+
+                    var client    = await listener.AcceptTcpClientAsync(ct);
+                    var endpoint  = client.Client.RemoteEndPoint as IPEndPoint;
+                    _logger.Log(LogLevel.Info, $"[{portType}] Connection from {endpoint?.Address}:{endpoint?.Port}");
+
+                    var session   = new SMTPSession(
+                                        client,
+                                        serverConfig,
+                                        _storage,
+                                        _dnsVerifier,
+                                        _certificate,
+                                        _userStore,
+                                        _mailQueue,
+                                        isSubmissionPort,
+                                        _logger
+                                    );
+
+                    var task      = session.HandleAsync(ct);
+
+                    _sessionTasks.Add(task);
+
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Log(LogLevel.Error, $"Accept error: {ex.Message}");
+                }
+            }
+        }
+
+        public async Task Stop()
+        {
+
+            _logger.Log(LogLevel.Info, "Stopping server...");
+            await _cts.CancelAsync();
+
+            foreach (var listener in _listeners)
+            {
+                listener.Stop();
+            }
+
+            await Task.WhenAll(_sessionTasks.ToArray());
+            _logger.Log(LogLevel.Info, "Server stopped");
+
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await Stop();
+            _cts.         Dispose();
+            _certificate?.Dispose();
+        }
+
+    }
+
+}

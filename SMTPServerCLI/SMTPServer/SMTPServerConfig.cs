@@ -1,0 +1,69 @@
+/*
+ * Copyright (c) 2010-2026 GraphDefined GmbH <achim.friedland@graphdefined.com>
+ * This file is part of Vanaheimr Hermod <https://www.github.com/Vanaheimr/Hermod>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
+{
+
+    public sealed record SMTPServerConfig
+    {
+        public required String    Hostname                  { get; init; }
+        public          UInt16    Port                      { get; init; } = 25;
+        public          UInt16    SubmissionPort            { get; init; } = 587;
+        public          String    MailStoragePath           { get; init; } = "./mailstore";
+        public          String?   CertificatePath           { get; init; }
+        public          String?   CertificatePassword       { get; init; }
+        public          TimeSpan  SessionTimeout            { get; init; } = TimeSpan.FromMinutes(5);
+        public          Int32     MaxMessageSize            { get; init; } = 25 * 1024 * 1024; // 25 MB
+        public          Int32     MaxRecipients             { get; init; } = 100;
+        public          Boolean   RequireStartTls           { get; init; } = false;
+        public          Boolean   VerifyDkim                { get; init; } = true;
+        public          Boolean   VerifySpf                 { get; init; } = true;
+        public          Boolean   VerifyDmarc               { get; init; } = true;
+
+        /// <summary>
+        /// Domains considered "local" - mail to these is stored locally.
+        /// Mail to other domains requires authentication (relay).
+        /// </summary>
+        public HashSet<String>   LocalDomains               { get; init; } = ["localhost", "localhost.localdomain"];
+
+        /// <summary>
+        /// Require authentication for relaying to external domains.
+        /// MUST be true in production to prevent becoming an open relay!
+        /// </summary>
+        public          Boolean  RequireAuthForRelay        { get; init; } = true;
+
+        /// <summary>
+        /// Require authentication on submission port (587) even for local delivery.
+        /// RFC 6409 recommends this.
+        /// </summary>
+        public          Boolean  RequireAuthOnSubmission    { get; init; } = true;
+
+
+
+        /// <summary>
+        /// Check if a domain is local (case-insensitive)
+        /// </summary>
+        public          Boolean  IsLocalDomain(String domain)
+
+             => LocalDomains.Contains(
+                    domain,
+                    StringComparer.OrdinalIgnoreCase
+                );
+
+    }
+
+}
