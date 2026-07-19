@@ -795,14 +795,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     return;
                 }
 
-                // === DKIM FAIL REJECT ===
+                // === DKIM ===
+                // DKIM is advisory (RFC 6376 §6.1): a broken/absent signature is not by itself
+                // a reason to reject. The result is recorded in Authentication-Results and left
+                // to DMARC (and downstream filters). Only log it here.
                 if (verification.Dkim == DkimResult.Fail)
-                {
-                    logger.Log(LogLevel.Warning, $"DKIM verification failed for message from {_mailFrom}");
-                    await SendResponseAsync(550, "5.7.20 DKIM signature verification failed");
-                    ResetTransaction();
-                    return;
-                }
+                    logger.Log(LogLevel.Info, $"DKIM verification failed for message from {_mailFrom} (advisory, not rejecting)");
 
                 // === DMARC POLICY ENFORCEMENT ===
                 if (verification.Dmarc == DmarcResult.Fail)

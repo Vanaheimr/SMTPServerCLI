@@ -424,22 +424,25 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
             try
             {
-                var dkimHeaders = message.Headers
-                    .Where(h => h.Key.Equals("DKIM-Signature", StringComparison.OrdinalIgnoreCase))
-                    .Select(h => h.Value)
-                    .ToList();
+                // Parse the raw message so canonicalization sees the original bytes
+                // (message.Headers are already unfolded/trimmed and unusable for DKIM).
+                var (headerBlock, body) = DkimCanonicalization.Split(message.RawMessage);
+                var fields              = DkimCanonicalization.ParseFields(headerBlock);
+                var dkimFields          = fields.Where(f => f.Name.Equals("DKIM-Signature", StringComparison.OrdinalIgnoreCase)).ToList();
 
-                if (dkimHeaders.Count == 0)
+                if (dkimFields.Count == 0)
                     return (DkimResult.None, "No DKIM signature found");
 
-                foreach (var dkimHeader in dkimHeaders)
+                (DkimResult Result, string? Details) last = (DkimResult.Fail, "All DKIM signatures failed verification");
+
+                foreach (var dkimField in dkimFields)
                 {
-                    var result = await VerifySingleDkimSignature(dkimHeader, message, ct);
-                    if (result.Result == DkimResult.Pass)
-                        return result;
+                    last = await VerifySingleDkimSignature(dkimField, fields, body, ct);
+                    if (last.Result == DkimResult.Pass)
+                        return last;
                 }
 
-                return (DkimResult.Fail, "All DKIM signatures failed verification");
+                return last;
             }
             catch (Exception ex)
             {
@@ -449,11 +452,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         }
 
         private async Task<(DkimResult Result, string? Details)> VerifySingleDkimSignature(
-            string            dkimHeader,
-            EMailMessage      message,
-            CancellationToken ct)
+            DkimHeaderField        dkimField,
+            List<DkimHeaderField>  fields,
+            string                 body,
+            CancellationToken      ct)
         {
-            var dkimParams = ParseDkimHeader(dkimHeader);
+            var dkimParams = ParseDkimHeader(dkimField.RawValue);
 
             if (!dkimParams.TryGetValue("d", out var domain) ||
                 !dkimParams.TryGetValue("s", out var selector) ||
@@ -475,20 +479,20 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             if (!dkimRecordParams.TryGetValue("p", out var publicKeyBase64))
                 return (DkimResult.Fail, "No public key in DKIM record");
 
-            // Verify body hash
             var algorithm = dkimParams.GetValueOrDefault("a", "rsa-sha256");
-            var canonicalization = dkimParams.GetValueOrDefault("c", "simple/simple");
-            var (headerCanon, bodyCanon) = ParseCanonicalization(canonicalization);
+            var (headerCanon, bodyCanon) = ParseCanonicalization(dkimParams.GetValueOrDefault("c", "simple/simple"));
 
-            var canonicalizedBody = CanonicalizeBody(message.Body, bodyCanon);
-            var computedBodyHash = ComputeBodyHash(canonicalizedBody, algorithm);
+            // Body hash over the wire octets (UTF-8), via the shared canonicalizer.
+            var canonicalizedBody = DkimCanonicalization.CanonicalizeBody(body, bodyCanon);
+            var bodyBytes         = Encoding.UTF8.GetBytes(canonicalizedBody);
+            var computedBodyHash  = Convert.ToBase64String(
+                                        algorithm.Contains("sha256")
+                                            ? SHA256.HashData(bodyBytes)
+                                            : SHA1.HashData(bodyBytes)
+                                    );
 
             if (computedBodyHash != bodyHash)
                 return (DkimResult.Fail, $"Body hash mismatch: expected {bodyHash}, got {computedBodyHash}");
-
-            // Verify signature
-            var signedHeaders = dkimParams.GetValueOrDefault("h", "").Split(':');
-            var headerData = BuildSignedHeaderData(message, signedHeaders, dkimHeader, headerCanon);
 
             try
             {
@@ -498,10 +502,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 using var rsa = RSA.Create();
                 rsa.ImportSubjectPublicKeyInfo(publicKeyBytes, out _);
 
-                var hashAlgorithm = algorithm.Contains("sha256") ? HashAlgorithmName.SHA256 : HashAlgorithmName.SHA1;
-                var headerBytes = Encoding.ASCII.GetBytes(headerData);
+                var signedHeaders = dkimParams.GetValueOrDefault("h", "").Split(':');
+                var signingInput  = DkimCanonicalization.BuildHeaderHashInput(fields, signedHeaders, dkimField, headerCanon);
 
-                var isValid = rsa.VerifyData(headerBytes, signatureBytes, hashAlgorithm, RSASignaturePadding.Pkcs1);
+                var hashAlgorithm = algorithm.Contains("sha256") ? HashAlgorithmName.SHA256 : HashAlgorithmName.SHA1;
+                var isValid       = rsa.VerifyData(Encoding.UTF8.GetBytes(signingInput), signatureBytes, hashAlgorithm, RSASignaturePadding.Pkcs1);
 
                 return isValid
                     ? (DkimResult.Pass, $"DKIM signature valid for domain {domain}")
@@ -553,86 +558,6 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
             var parts = c.Split('/');
             return (parts[0].ToLowerInvariant(), parts.Length > 1 ? parts[1].ToLowerInvariant() : parts[0].ToLowerInvariant());
-        }
-
-        private static string CanonicalizeBody(string body, string method)
-        {
-            if (method == "relaxed")
-            {
-                var lines = body.Split("\r\n");
-                var canonicalized = lines
-                    .Select(line => Regex.Replace(line, @"[ \t]+", " ").TrimEnd())
-                    .ToList();
-            
-                // Remove trailing empty lines
-                while (canonicalized.Count > 0 && string.IsNullOrEmpty(canonicalized[^1]))
-                    canonicalized.RemoveAt(canonicalized.Count - 1);
-            
-                return string.Join("\r\n", canonicalized) + "\r\n";
-            }
-            else // simple
-            {
-                var result = body;
-                while (result.EndsWith("\r\n\r\n"))
-                    result = result[..^2];
-                if (!result.EndsWith("\r\n"))
-                    result += "\r\n";
-                return result;
-            }
-        }
-
-        private static string ComputeBodyHash(string body, string algorithm)
-        {
-            var bytes = Encoding.ASCII.GetBytes(body);
-            byte[] hash;
-
-            if (algorithm.Contains("sha256"))
-                hash = SHA256.HashData(bytes);
-            else
-                hash = SHA1.HashData(bytes);
-
-            return Convert.ToBase64String(hash);
-        }
-
-        private static string BuildSignedHeaderData(EMailMessage message, string[] signedHeaders, string dkimHeader, string method)
-        {
-            var sb = new StringBuilder();
-
-            foreach (var headerName in signedHeaders)
-            {
-                var trimmedName = headerName.Trim();
-                var headerValue = message.Headers
-                    .FirstOrDefault(h => h.Key.Equals(trimmedName, StringComparison.OrdinalIgnoreCase))
-                    .Value;
-
-                if (headerValue is not null)
-                {
-                    if (method == "relaxed")
-                    {
-                        var canonName = trimmedName.ToLowerInvariant();
-                        var canonValue = Regex.Replace(headerValue, @"[ \t]+", " ").Trim();
-                        sb.Append($"{canonName}:{canonValue}\r\n");
-                    }
-                    else
-                    {
-                        sb.Append($"{trimmedName}: {headerValue}\r\n");
-                    }
-                }
-            }
-
-            // Add DKIM-Signature header without the b= value
-            var dkimForSigning = Regex.Replace(dkimHeader, @"b=[^;]*", "b=");
-            if (method == "relaxed")
-            {
-                var canonValue = Regex.Replace(dkimForSigning, @"[ \t]+", " ").Trim();
-                sb.Append($"dkim-signature:{canonValue}");
-            }
-            else
-            {
-                sb.Append($"DKIM-Signature: {dkimForSigning}");
-            }
-
-            return sb.ToString();
         }
 
         #endregion
