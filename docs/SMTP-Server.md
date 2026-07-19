@@ -431,9 +431,16 @@ notifications by passing `DsnParameters` to the send facades; they are attached 
 server advertises the `DSN` extension**:
 
 ```csharp
-await sender.SendAsync(mail,
-    Dsn: new DsnParameters(DsnNotify.Success | DsnNotify.Failure, DsnRet.Full, EnvId: "order-4711"));
+await sender.SendAsync(new EMailEnvelop(mail) {
+    Dsn = new DsnParameters(DsnNotify.Success | DsnNotify.Failure, DsnRet.Full, EnvId: "order-4711")
+});
 ```
+
+DSN, `MT-PRIORITY` and `REQUIRETLS` are **envelope (transaction) parameters** — they
+travel on `MAIL FROM`/`RCPT TO`, have no header representation, and are invisible to
+the recipient's mail client. They therefore live on the `EMailEnvelop`, not on the
+`EMail` (whose header-level counterparts are `Importance` and
+`Disposition-Notification-To`) and not on the send methods.
 
 `DsnNotify` is a `[Flags]` enum (`Success`/`Failure`/`Delay`, or `Never`). The
 receiving/relaying side emits the matching `multipart/report; report-type=delivery-status`
@@ -492,7 +499,7 @@ Two independent notions of priority:
 ```csharp
 var b = new HTMLEMailBuilder { Subject = "Rechnung", HTMLText = "…", Importance = MailImportance.High };
 …
-await sender.SendAsync(b, Priority: 4);   // MT-PRIORITY=4 to the next hop; scheduled ahead of normal mail
+await sender.SendAsync(new EMailEnvelop(b) { Priority = 4 });   // MT-PRIORITY=4; scheduled ahead of normal mail
 ```
 
 ---
