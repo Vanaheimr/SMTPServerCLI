@@ -70,6 +70,7 @@ calls in the active code.
 |-----------|-----|-------|
 | `SIZE` | [RFC 1870](https://www.rfc-editor.org/rfc/rfc1870) | Advertised with the configured max (default 25 MB) |
 | `8BITMIME` | [RFC 6152](https://www.rfc-editor.org/rfc/rfc6152) | 8-bit content accepted |
+| `PIPELINING` | [RFC 2920](https://www.rfc-editor.org/rfc/rfc2920) | Command groups processed in order; buffered reader is pipeline-safe |
 | `SMTPUTF8` | [RFC 6531](https://www.rfc-editor.org/rfc/rfc6531) | Internationalized email; UTF-8 preserved end-to-end |
 | `ENHANCEDSTATUSCODES` | [RFC 2034](https://www.rfc-editor.org/rfc/rfc2034) | `x.y.z` codes on responses |
 | `CHUNKING` (`BDAT`) | [RFC 3030](https://www.rfc-editor.org/rfc/rfc3030) | Binary-safe, dot-stuffing-free transfer |
@@ -87,8 +88,12 @@ calls in the active code.
   after the terminating `.` so the connection stays in sync.
 - UTF-8 preserved on both the `DATA` and `BDAT` paths; CRLF forced independent
   of host OS.
-
-> **Not advertised:** `PIPELINING` (RFC 2920) is not implemented.
+- **PIPELINING** (RFC 2920): commands are read from a buffered reader and
+  answered in order, so a client may send whole command groups
+  (`MAIL`/`RCPT`/`DATA`) without waiting for each reply. Replies are flushed per
+  command, so all responses preceding `DATA` are on the wire before the message
+  body is read. Buffered plaintext is discarded across `STARTTLS`, preventing
+  the pipelined plaintext-injection attack (RFC 3207 §4.2).
 
 ---
 
@@ -235,7 +240,7 @@ written into an `Authentication-Results` header
 | 8601 | Authentication-Results | ✅ |
 | 7435 | Opportunistic security (TLS) | ✅ outbound cert policy |
 | 7489 | DMARC | ✅ identifier alignment + PSL; ⚠️ no `rua`/`ruf` reports |
-| 2920 | PIPELINING | ❌ not implemented |
+| 2920 | PIPELINING | ✅ |
 | 8314 | Implicit TLS (port 465) | ✅ implicit-TLS submission |
 | 8617 | ARC | ❌ not implemented |
 
@@ -257,6 +262,7 @@ scratchpad (`dnstest/`, `pgp_smtp_test.py`, `dkim_sign.py`, `dkim_verify.py`).
 | **Address parser** | 20 unit assertions incl. the previously-broken cases (`user@localhost`, `user+tag@`, quoted local-parts, domain-literals, IDN, groups). |
 | **Outbound TLS** | Tested against our own self-signed server: opportunistic → `Success 250`; strict → `TempFail 454`. |
 | **Implicit TLS (465)** | A real `SslStream` client handshakes from the first byte, receives the `220` greeting and `EHLO` response over TLS, and confirms `STARTTLS` is not advertised while `AUTH PLAIN/LOGIN` is; the plaintext 587 port still advertises `STARTTLS`. |
+| **PIPELINING** | A client sends `MAIL`/`RCPT`/`DATA` as one socket write (and, in a second test, the entire `EHLO`…`DATA`…body…`QUIT` session in a single write); all replies come back in order and both messages land on disk. |
 
 ---
 
@@ -411,7 +417,7 @@ Honest list of what stands between this and a production Internet MX:
 - **Self-signed inbound cert by default** — must be replaced.
 - **Not security-audited** — the parsers process untrusted Internet input and
   have not been fuzzed or reviewed for DoS/injection.
-- **Operational gaps** — no mail-loop/`Received`-hop-count limit, no PIPELINING,
+- **Operational gaps** — no mail-loop/`Received`-hop-count limit,
   no metrics/alerting; queue durability is not battle-tested.
 - **Header internationalization** (RFC 2047 encoded-words / RFC 6532) is only
   partially handled.
@@ -427,7 +433,7 @@ core it is designed to be.
 - DMARC aggregate/forensic (`rua`/`ruf`) report generation. _(Identifier
   alignment and the Public Suffix List are now implemented.)_
 - ARC ([RFC 8617](https://www.rfc-editor.org/rfc/rfc8617)) for forwarding.
-- PIPELINING (RFC 2920), TLS-RPT (RFC 8460).
+- TLS-RPT (RFC 8460).
 - DANE / TLSA ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672)).
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.

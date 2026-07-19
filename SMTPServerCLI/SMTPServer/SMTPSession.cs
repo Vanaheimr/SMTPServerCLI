@@ -280,6 +280,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 $"{config.Hostname} Hello {hostname}",
                 $"SIZE {config.MaxMessageSize}",
                 "8BITMIME",
+                "PIPELINING", // RFC 2920 - command pipelining
                 "ENHANCEDSTATUSCODES",
                 "CHUNKING",  // RFC 3030 - BDAT command
                 "DSN",       // RFC 3461 - Delivery Status Notifications
@@ -443,6 +444,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 ct
             );
 
+            // Replace the reader/writer with fresh ones on the encrypted stream. This also
+            // DISCARDS any bytes the old plaintext reader may have buffered past the STARTTLS
+            // line — a client MUST NOT pipeline across STARTTLS (RFC 3207 §4.2), so any such
+            // pre-TLS plaintext is treated as an injection attempt and dropped, never executed
+            // as a post-TLS command (the plaintext-command-injection class, CVE-2011-0411).
             _stream = sslStream;
             _reader = new StreamReader(sslStream, Encoding.Latin1);
             _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true, NewLine = "\r\n" };
