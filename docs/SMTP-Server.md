@@ -467,8 +467,13 @@ if (incoming.IsReadReceiptRequested)
 The MDN carries the RFC 8098 `message/disposition-notification` part
 (`Disposition: automatic-action/MDN-sent-automatically; displayed`, `Final-Recipient`,
 `Original-Message-ID`) and is stamped `Auto-Submitted: auto-replied` to prevent loops.
-Note that generating an MDN is a **mail-client** concern (the MTA only stores inbound
-mail as `.eml`); these methods exist so a client built on Hermod's `EMail` can do it.
+Generating an MDN is normally a **mail-client** concern. As a convenience, the local
+delivery step can also do it automatically: `MdnGeneratingMailStorage` (an
+`IMailStorage` decorator, enabled with `SMTP_AUTO_MDN=true` / `EnableAutoMdn`) emits an
+MDN per local recipient when a stored message requested one — reporting disposition
+`processed` / automatic-action (a delivery agent handled it, it was not *displayed*).
+This is opt-in and privacy-sensitive (RFC 8098 §2.1: automatic MDNs confirm a live
+address and can loop). `SMTPServer` also accepts an injected `IMailStorage`.
 
 ### Priority
 
@@ -584,6 +589,7 @@ Configured via environment variables (see `SMTPServerCLI/SMTPServerCLI/Program.c
 | `DMARC_FORENSIC` | – | `true` → also emit DMARC forensic (RUF/ARF) reports |
 | `DMARC_REPORT_EMAIL` | `dmarc-reports@<hostname>` | From/return-path for reports (its domain must be DKIM-signable) |
 | `DMARC_REPORT_ORG` | `<hostname>` | `org_name` in aggregate reports |
+| `SMTP_AUTO_MDN` | – | `true` → auto-generate a read receipt (MDN) on local delivery when the message requested one (opt-in, privacy-sensitive) |
 
 Ports default to 2525/2587 so the server runs without root. A self-signed TLS
 certificate (`server.pfx`) and default users (`admin`/`user` = `test123`,

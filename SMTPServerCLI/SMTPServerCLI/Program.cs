@@ -73,7 +73,8 @@ var smtpServerConfig  = new SMTPServerConfig {
                             DmarcReportOrgName       = Environment.GetEnvironmentVariable("DMARC_REPORT_ORG"),
 
                             // TLS-RPT (RFC 8460) inbound report ingestion - opt-in
-                            EnableTlsRptIngestion    = Environment.GetEnvironmentVariable("TLSRPT_INGEST") == "true"
+                            EnableTlsRptIngestion    = Environment.GetEnvironmentVariable("TLSRPT_INGEST") == "true",
+                            EnableAutoMdn            = Environment.GetEnvironmentVariable("SMTP_AUTO_MDN") == "true"
 
                         };
 
