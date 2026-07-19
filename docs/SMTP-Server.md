@@ -305,8 +305,11 @@ still trust them after SPF/DKIM break in transit.
 - **Read receipts** (MDN, RFC 8098): a client can request one (the builder's
   `DispositionNotificationTo`) and generate one from a received `EMail`
   (`CreateReadReceipt`, see below).
+- **Priority:** header-level `Importance` (RFC 2156) for the recipient's client,
+  and transport-level `MT-PRIORITY` (RFC 6710) — advertised in EHLO, parsed from
+  `MAIL FROM`, carried onto the relay, and used to **order the outbound queue**.
 - **Outbound queue:** file-persistent, exponential-backoff retries, MX priority
-  ordering, per-domain concurrency limits.
+  ordering, **MT-PRIORITY scheduling**, per-domain concurrency limits.
 
 ### Sending mail
 
@@ -457,6 +460,26 @@ The MDN carries the RFC 8098 `message/disposition-notification` part
 Note that generating an MDN is a **mail-client** concern (the MTA only stores inbound
 mail as `.eml`); these methods exist so a client built on Hermod's `EMail` can do it.
 
+### Priority
+
+Two independent notions of priority:
+
+- **Message importance** (RFC 2156) — a *display/handling* hint for the recipient's
+  client. Set `Importance` (`Low`/`Normal`/`High`) on a builder; `High`/`Low` stamp
+  the `Importance` / `Priority` / `X-Priority` / `X-MSMail-Priority` headers, and
+  `EMail.Importance` reads them back (precedence Importance → X-Priority → X-MSMail-Priority).
+- **Transport priority** (`MT-PRIORITY`, RFC 6710) — an integer `-9..9` (default 0,
+  higher is more urgent) that drives **queue scheduling**. Pass `Priority` to the send
+  facades; it is emitted on `MAIL FROM` only when the next hop advertises `MT-PRIORITY`,
+  and the outbound queue delivers higher-priority mail first. The server advertises the
+  extension, parses `MT-PRIORITY=` from inbound `MAIL FROM`, and carries it onto the relay.
+
+```csharp
+var b = new HTMLEMailBuilder { Subject = "Rechnung", HTMLText = "…", Importance = MailImportance.High };
+…
+await sender.SendAsync(b, Priority: 4);   // MT-PRIORITY=4 to the next hop; scheduled ahead of normal mail
+```
+
 ---
 
 ## Standards conformance
@@ -473,6 +496,8 @@ mail as `.eml`); these methods exist so a client built on Hermod's `EMail` can d
 | 3207 | STARTTLS | ✅ |
 | 3461 / 3464 | DSN | ✅ failure/delay/success; sender-requested `NOTIFY`/`RET`/`ENVID` |
 | 8098 | MDN (read receipts) | ✅ request + generate from an `EMail` (client-side) |
+| 6710 | MT-PRIORITY | ✅ EHLO/MAIL FROM + priority-ordered outbound queue |
+| 2156 | Message importance (`Importance`) | ✅ header-level, build + parse |
 | 4954 | SMTP AUTH | ✅ |
 | 4616 / 7677 / 4422 | PLAIN / SCRAM-SHA-256 / EXTERNAL | ✅ |
 | 6409 | Message submission | ✅ (auth required on 587) |
@@ -720,5 +745,3 @@ core it is designed to be.
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.
 - Anti-spam / greylisting / DNSBL integration.
-- Message **priority**: header-level (`Importance`/`X-Priority`) and the
-  `MT-PRIORITY` ESMTP extension (RFC 6710) with priority-aware queue scheduling.
