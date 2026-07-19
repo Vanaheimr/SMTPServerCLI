@@ -80,6 +80,14 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         public          UInt32   WriteTimeoutMs       { get; init; } = 60_000;
         public          Boolean  RequireStartTls      { get; init; } = false;
         public          Boolean  PreferStartTls       { get; init; } = true;
+
+        /// <summary>
+        /// Require a valid server certificate for EVERY TLS delivery (not just enforced ones).
+        /// Default false = opportunistic TLS (RFC 7435): encrypt even with a bad certificate.
+        /// Certificates are always validated strictly when TLS is enforced (MTA-STS enforce,
+        /// REQUIRETLS, or RequireStartTls), regardless of this flag.
+        /// </summary>
+        public          Boolean  RequireValidCertificate { get; init; } = false;
         public          String?  SmartHost            { get; init; }  // Optional relay host
         public          UInt16   SmartHostPort        { get; init; } = 25;
         public          String?  SmartHostUsername    { get; init; }
@@ -299,13 +307,28 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                     if (starttlsResponse.StartsWith("220"))
                     {
-                        // Upgrade to TLS
-                        var sslStream = new SslStream(stream, false, ValidateServerCertificate);
-                        await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                        // Validate the certificate strictly when TLS is enforced (MTA-STS enforce,
+                        // REQUIRETLS, RequireStartTls) or when the operator demands it; otherwise
+                        // TLS is opportunistic (RFC 7435) — encrypt but don't fail on a bad cert.
+                        var validateStrict = enforceTls || _config.RequireValidCertificate;
+
+                        var sslStream = new SslStream(stream, false,
+                            (_, cert, chain, errors) => ValidateServerCertificate(mxHost, validateStrict, cert, chain, errors));
+
+                        try
                         {
-                            TargetHost = mxHost,
-                            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
-                        }, ct);
+                            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                            {
+                                TargetHost = mxHost,
+                                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
+                            }, ct);
+                        }
+                        catch (AuthenticationException ex)
+                        {
+                            // A rejected/mismatched certificate under enforced TLS must not be
+                            // bypassed: defer delivery instead of sending over an untrusted channel.
+                            return SendResult.TempFail(454, $"TLS certificate validation failed for {mxHost}: {ex.Message}", mxHost);
+                        }
 
                         stream = sslStream;
                         reader = new StreamReader(sslStream, Encoding.UTF8);
@@ -550,20 +573,31 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         #region Certificate Validation
 
-        private Boolean ValidateServerCertificate(Object            sender,
+        private Boolean ValidateServerCertificate(String            mxHost,
+                                                  Boolean           strict,
                                                   X509Certificate?  certificate,
                                                   X509Chain?        chain,
                                                   SslPolicyErrors   sslPolicyErrors)
         {
 
-            // In production, implement proper certificate validation
-            // For now, log issues but accept (many mail servers have cert issues)
-            if (sslPolicyErrors != SslPolicyErrors.None)
+            // Fully valid: chains to a trusted root, matches the MX host, and is present.
+            if (sslPolicyErrors == SslPolicyErrors.None)
+                return true;
+
+            if (strict)
             {
-                _logger.Log(LogLevel.Warning, $"TLS certificate warning: {sslPolicyErrors}");
+                // Enforced TLS: the certificate MUST be PKIX-valid and match the MX host name
+                // (RFC 8461 §4.1 / RFC 8689). Reject so delivery is deferred, not downgraded.
+                _logger.Log(LogLevel.Error,
+                    $"TLS certificate for {mxHost} rejected under enforced TLS: {sslPolicyErrors}");
+                return false;
             }
 
-            return true; // Accept for now - mail delivery is more important than strict TLS
+            // Opportunistic TLS (RFC 7435): encryption is still better than cleartext, so accept
+            // the certificate but record the problem for visibility.
+            _logger.Log(LogLevel.Warning,
+                $"TLS certificate issue for {mxHost} (opportunistic, accepting): {sslPolicyErrors}");
+            return true;
 
         }
 
