@@ -59,7 +59,8 @@ the table are relative to that folder); only the CLI entry point
 | `DkimSigner` + `DkimCanonicalization` | `DNSVerifications/` | RFC 6376 signing / shared canonicalizer |
 | `SpfMacros` | `DNSVerifications/SpfMacros.cs` | RFC 7208 §7 macro expansion |
 | `MailAddressParser` | `MailAddressParser.cs` | RFC 5322 From/To address parsing |
-| `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay |
+| `MailSender` | `MailSender.cs` | Public send entry point: takes a typed `EMail`/`EMailEnvelop` (Hermod.Mail builders — HTML, multipart, attachments, PGP), serializes it, fans recipients out per domain, enqueues |
+| `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay (raw-string `SendAsync` is `internal`) |
 | `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue, retries, DSN bounces |
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
@@ -300,6 +301,28 @@ still trust them after SPF/DKIM break in transit.
   `multipart/report` bounces; null sender (`<>`) handled to avoid bounce loops.
 - **Outbound queue:** file-persistent, exponential-backoff retries, MX priority
   ordering, per-domain concurrency limits.
+
+### Sending mail
+
+Compose with the rich `Hermod.Mail` builders (HTML, multipart, attachments,
+OpenPGP), then hand the typed message to **`MailSender`** — the single public
+send entry point. It serializes the message, splits recipients per domain, and
+enqueues them; a running `QueueProcessor` does the actual MX/TLS/DANE delivery.
+
+```csharp
+var mail = new HTMLEMailBuilder {
+    Subject = "Rechnung", HTMLText = "<h1>Hallo</h1>", PlainText = "Hallo",
+};
+mail.From = SimpleEMailAddress.Parse("me@example.com");
+mail.To   = (EMailAddress) SimpleEMailAddress.Parse("you@example.org");
+mail.AddAttachment(pdfBytes, "rechnung.pdf");
+
+await new MailSender(mailQueue, logger).SendAsync(mail);   // builder → EMail (implicit)
+```
+
+The raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and hand-crafting a
+`QueuedMail`) are `internal`, so callers cannot enqueue an unchecked message
+string — everything goes through the typed `MailSender`.
 
 ---
 
