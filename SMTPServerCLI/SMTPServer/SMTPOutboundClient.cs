@@ -88,6 +88,15 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         /// REQUIRETLS, or RequireStartTls), regardless of this flag.
         /// </summary>
         public          Boolean  RequireValidCertificate { get; init; } = false;
+
+        /// <summary>
+        /// Enable DANE (RFC 7672): look up DNSSEC-validated TLSA records for the target MX and,
+        /// when present, enforce STARTTLS and authenticate the server certificate against them.
+        /// Requires a DNSSEC-aware resolver path (the DNS client's DO bit is enabled automatically).
+        /// Default false.
+        /// </summary>
+        public          Boolean  EnableDane           { get; init; } = false;
+
         public          String?  SmartHost            { get; init; }  // Optional relay host
         public          UInt16   SmartHostPort        { get; init; } = 25;
         public          String?  SmartHostUsername    { get; init; }
@@ -104,6 +113,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private readonly SmtpOutboundConfig  _config;
         private readonly DkimSigner?         __dkimSigner;
         private readonly MtaStsResolver      _mtaStsResolver;
+        private readonly DaneResolver?       _daneResolver;
         private readonly DNSClient           _dnsClient;
         private readonly ILogger             _logger;
 
@@ -118,6 +128,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             this._dnsClient       = dnsClient;
             this._logger          = logger;
             this._mtaStsResolver  = new MtaStsResolver(dnsClient, logger);
+            this._daneResolver    = config.EnableDane
+                                        ? new DaneResolver(dnsClient, logger)
+                                        : null;
 
         }
 
@@ -253,6 +266,36 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                                         CancellationToken   ct)
         {
 
+            // DANE (RFC 7672): resolve DNSSEC-validated TLSA records for this MX host up front.
+            // A "bogus" result means the destination advertises DANE but the records cannot be
+            // trusted — fail closed and defer rather than risk an unauthenticated channel.
+            var                  daneActive   = false;
+            IReadOnlyList<TLSA>  daneRecords  = [];
+
+            if (_daneResolver is not null)
+            {
+
+                var dane = await _daneResolver.ResolveTlsaAsync(mxHost, port, ct);
+
+                if (dane.MustDefer)
+                {
+                    _logger.Log(LogLevel.Error,
+                        $"DANE: TLSA records for {mxHost} failed DNSSEC validation ({dane.Detail}); deferring");
+                    return SendResult.TempFail(450, $"DANE TLSA validation failed for {mxHost}: {dane.Detail}", mxHost);
+                }
+
+                daneActive   = dane.IsUsable;
+                daneRecords  = dane.Records;
+
+                if (daneActive)
+                    _logger.Log(LogLevel.Info,
+                        $"DANE active for {mxHost}: {daneRecords.Count} usable TLSA record(s), TLS enforced");
+
+            }
+
+            // DANE mandates authenticated TLS to this MX (RFC 7672 §2.2).
+            var mustEnforceTls = enforceTls || daneActive;
+
             using var client = new TcpClient();
             client.SendTimeout    = (Int32) _config.WriteTimeoutMs;
             client.ReceiveTimeout = (Int32) _config.ReadTimeoutMs;
@@ -297,7 +340,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 var supportsStartTls = ehloResponse.Lines.Any(l => 
                     l.Contains("STARTTLS", StringComparison.OrdinalIgnoreCase));
 
-                var wantTls = enforceTls || _config.RequireStartTls || _config.PreferStartTls;
+                var wantTls = mustEnforceTls || _config.RequireStartTls || _config.PreferStartTls;
 
                 if (supportsStartTls && wantTls)
                 {
@@ -307,13 +350,15 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                     if (starttlsResponse.StartsWith("220"))
                     {
-                        // Validate the certificate strictly when TLS is enforced (MTA-STS enforce,
-                        // REQUIRETLS, RequireStartTls) or when the operator demands it; otherwise
-                        // TLS is opportunistic (RFC 7435) — encrypt but don't fail on a bad cert.
-                        var validateStrict = enforceTls || _config.RequireValidCertificate;
+                        // Under DANE the TLSA record authenticates the certificate directly — no
+                        // PKIX path or name check (RFC 7672 §3.1). Otherwise validate strictly when
+                        // TLS is enforced, else opportunistically (RFC 7435): encrypt but tolerate a bad cert.
+                        var validateStrict = mustEnforceTls || _config.RequireValidCertificate;
 
                         var sslStream = new SslStream(stream, false,
-                            (_, cert, chain, errors) => ValidateServerCertificate(mxHost, validateStrict, cert, chain, errors));
+                            (_, cert, chain, errors) => daneActive
+                                ? ValidateDaneCertificate(mxHost, daneRecords, cert, chain)
+                                : ValidateServerCertificate(mxHost, validateStrict, cert, chain, errors));
 
                         try
                         {
@@ -325,30 +370,36 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                         }
                         catch (AuthenticationException ex)
                         {
-                            // A rejected/mismatched certificate under enforced TLS must not be
-                            // bypassed: defer delivery instead of sending over an untrusted channel.
-                            return SendResult.TempFail(454, $"TLS certificate validation failed for {mxHost}: {ex.Message}", mxHost);
+                            // A rejected/mismatched certificate under enforced TLS (including a DANE
+                            // TLSA mismatch) must not be bypassed: defer instead of downgrading.
+                            var why = daneActive ? "DANE TLSA mismatch" : "certificate validation failed";
+                            return SendResult.TempFail(454, $"TLS {why} for {mxHost}: {ex.Message}", mxHost);
                         }
 
                         stream = sslStream;
                         reader = new StreamReader(sslStream, Encoding.UTF8);
                         writer = new StreamWriter(sslStream, new UTF8Encoding(false)) { AutoFlush = true, NewLine = "\r\n" };
 
-                        _logger.Log(LogLevel.Debug, $"TLS established with {mxHost}: {sslStream.SslProtocol}");
+                        _logger.Log(LogLevel.Debug,
+                            $"TLS established with {mxHost}: {sslStream.SslProtocol}{(daneActive ? " (DANE-authenticated)" : "")}");
 
                         // Re-send EHLO after TLS
                         await writer.WriteLineAsync($"EHLO {_config.LocalHostname}");
                         ehloResponse = await ReadMultilineResponseAsync(reader, ct);
                     }
-                    else if (enforceTls || _config.RequireStartTls)
+                    else if (mustEnforceTls || _config.RequireStartTls)
                     {
                         return SendResult.TempFail(454, $"STARTTLS required but failed: {starttlsResponse}", mxHost);
                     }
 
                 }
-                else if (enforceTls || _config.RequireStartTls)
+                else if (mustEnforceTls || _config.RequireStartTls)
                 {
-                    return SendResult.TempFail(454, "STARTTLS required but not supported", mxHost);
+                    return SendResult.TempFail(454,
+                        daneActive
+                            ? $"DANE requires STARTTLS but {mxHost} does not offer it"
+                            : "STARTTLS required but not supported",
+                        mxHost);
                 }
 
                 // AUTH if smarthost credentials provided
@@ -572,6 +623,36 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         #endregion
 
         #region Certificate Validation
+
+        /// <summary>
+        /// DANE (RFC 7672) certificate check: accept the server certificate iff it matches at
+        /// least one DNSSEC-validated TLSA record. PKIX chain/name errors are irrelevant here —
+        /// the TLSA record is the sole authenticator.
+        /// </summary>
+        private Boolean ValidateDaneCertificate(String               mxHost,
+                                                IReadOnlyList<TLSA>  tlsaRecords,
+                                                X509Certificate?     certificate,
+                                                X509Chain?           chain)
+        {
+
+            if (certificate is null)
+            {
+                _logger.Log(LogLevel.Error, $"DANE: {mxHost} presented no certificate; refusing delivery");
+                return false;
+            }
+
+            var leaf = certificate as X509Certificate2
+                           ?? X509CertificateLoader.LoadCertificate(certificate.GetRawCertData());
+
+            var matched = DaneAuthenticator.Matches(tlsaRecords, leaf, chain, _logger);
+
+            if (!matched)
+                _logger.Log(LogLevel.Error,
+                    $"DANE: server certificate for {mxHost} matched none of the {tlsaRecords.Count} TLSA record(s); refusing delivery");
+
+            return matched;
+
+        }
 
         private Boolean ValidateServerCertificate(String            mxHost,
                                                   Boolean           strict,

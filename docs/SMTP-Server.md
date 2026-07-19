@@ -52,12 +52,13 @@ reference implementations.
 | `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue, retries, DSN bounces |
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
+| `DaneResolver` + `DaneAuthenticator` | `Dane.cs` | RFC 7672 DNSSEC-validated TLSA lookup + certificate matching |
 | `DmarcReportService` + `DmarcAggregator` | `Reporting/` | RFC 7489 §7 aggregate (RUA) + forensic (RUF/ARF) report generation |
 | `ArcValidator` + `ArcSealer` + `ArcChain` | `Arc/` | RFC 8617 Authenticated Received Chain validation and sealing |
 
-All DNS lookups (TXT, MX, A/AAAA, PTR, MTA-STS) go through the injected Hermod
-`DNSClient` — there are no `nslookup`/`dig` subprocesses or `System.Net.Dns`
-calls in the active code.
+All DNS lookups (TXT, MX, A/AAAA, PTR, MTA-STS, TLSA + DNSSEC RRSIG/DNSKEY/DS)
+go through the injected Hermod `DNSClient` — there are no `nslookup`/`dig`
+subprocesses or `System.Net.Dns` calls in the active code.
 
 ---
 
@@ -145,6 +146,24 @@ production.
 - **MTA-STS** ([RFC 8461](https://www.rfc-editor.org/rfc/rfc8461)): policy is
   fetched via `_mta-sts` TXT + `https://mta-sts.<domain>/.well-known/mta-sts.txt`;
   MX hosts are filtered against the policy in enforce mode.
+- **DANE** ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672) / [RFC 6698](https://www.rfc-editor.org/rfc/rfc6698),
+  opt-in via `SMTP_DANE=true`): before delivering to an MX, `DaneResolver`
+  (`Dane.cs`) looks up `_25._tcp.<mx>` TLSA records and **DNSSEC-validates** them
+  with Hermod's `DNSSECValidator` (full chain of trust to the IANA root).
+  - *Secure* TLSA records → STARTTLS is **enforced** and the server certificate
+    must match a record (`DaneAuthenticator`): usages DANE-EE(3) / DANE-TA(2),
+    selectors full-cert / SPKI, matching exact / SHA-256 / SHA-512. A DANE match
+    authenticates the certificate directly — no PKIX path or name check
+    (RFC 7672 §3.1). PKIX-TA(0)/PKIX-EE(1) are ignored for SMTP.
+  - *Bogus / indeterminate* DNSSEC → the destination is treated as broken and
+    delivery is **deferred** (fail-closed), never downgraded.
+  - No TLSA (or an unsigned zone) → DANE does not apply; delivery proceeds under
+    the opportunistic / MTA-STS policy above.
+
+  Enabling DANE sets the DNS client's EDNS **DO bit** so RRSIG/DNSKEY/DS records
+  are returned. The `DNSSECValidator` performs real RRSIG signature verification
+  (RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519/Ed448) and DS-based delegation
+  walking; it is cross-checked against live signed zones (posteo.de, mailbox.org).
 - **REQUIRETLS** ([RFC 8689](https://www.rfc-editor.org/rfc/rfc8689)): honored on
   `MAIL FROM` and propagated to enforced outbound delivery.
 
@@ -281,6 +300,8 @@ still trust them after SPF/DKIM break in transit.
 | 2920 | PIPELINING | ✅ |
 | 8314 | Implicit TLS (port 465) | ✅ implicit-TLS submission |
 | 8617 | ARC | ✅ chain validation + sealing, cross-validated with dkimpy |
+| 6698 / 7672 | DANE / TLSA for SMTP | ✅ DNSSEC-validated TLSA pinning (opt-in), verified against live signed zones |
+| 4033–4035 | DNSSEC validation | ✅ RRSIG/DS chain to IANA root (via Hermod `DNSSECValidator`) |
 
 ---
 
@@ -323,6 +344,7 @@ Configured via environment variables (see `SMTPServerCLI/Program.cs`):
 | `DKIM_AUTO_GENERATE` | – | `true` → generate a keypair if none exists |
 | `SMTP_SMARTHOST` | – | Optional relay host for outbound |
 | `SMTP_SMARTHOST_PORT` / `_USER` / `_PASS` | `25` / – / – | Smarthost port & credentials |
+| `SMTP_DANE` | – | `true` → enable DANE/TLSA (RFC 7672) DNSSEC-validated TLS pinning for outbound |
 | `DMARC_REPORTING` | – | `true` → emit DMARC aggregate (RUA) reports |
 | `DMARC_FORENSIC` | – | `true` → also emit DMARC forensic (RUF/ARF) reports |
 | `DMARC_REPORT_EMAIL` | `dmarc-reports@<hostname>` | From/return-path for reports (its domain must be DKIM-signable) |
@@ -470,8 +492,8 @@ core it is designed to be.
 
 ## Not implemented / roadmap
 
-- TLS-RPT (RFC 8460).
-- DANE / TLSA ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672)).
+- TLS-RPT ([RFC 8460](https://www.rfc-editor.org/rfc/rfc8460)) — the reporting
+  layer over DANE/MTA-STS (TLSA/STARTTLS success & failure reports).
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.
 - Anti-spam / greylisting / DNSBL integration.

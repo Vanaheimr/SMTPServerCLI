@@ -131,6 +131,8 @@ var outboundConfig = new SmtpOutboundConfig {
     LocalHostname      = hostname,
     PreferStartTls     = true,
     RequireStartTls    = false,
+    // DANE (RFC 7672): DNSSEC-validated TLSA pinning for outbound delivery. Opt-in via SMTP_DANE=true.
+    EnableDane         = Environment.GetEnvironmentVariable("SMTP_DANE") == "true",
     SmartHost          =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST"),
     SmartHostPort      = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_SMARTHOST_PORT"), out var shp) ? shp : (UInt16) 25,
     SmartHostUsername  =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST_USER"),
@@ -167,6 +169,7 @@ Console.WriteLine($"""
       DKIM Signing:   {dkimSigner is not null}
       DMARC Reports:  {(smtpServerConfig.EnableDmarcReporting ? $"on (forensic={smtpServerConfig.EnableDmarcForensic})" : "off")}
       Smarthost:      {outboundConfig.SmartHost ?? "(direct delivery)"}
+      DANE (out):     {(outboundConfig.EnableDane ? "on (RFC 7672, DNSSEC TLSA)" : "off")}
       Relay Auth:     Required (prevents open relay)
     """);
 
