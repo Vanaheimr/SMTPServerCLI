@@ -59,7 +59,8 @@ the table are relative to that folder); only the CLI entry point
 | `DkimSigner` + `DkimCanonicalization` | `DNSVerifications/` | RFC 6376 signing / shared canonicalizer |
 | `SpfMacros` | `DNSVerifications/SpfMacros.cs` | RFC 7208 §7 macro expansion |
 | `MailAddressParser` | `MailAddressParser.cs` | RFC 5322 From/To address parsing |
-| `MailSender` | `MailSender.cs` | Public send entry point: takes a typed `EMail`/`EMailEnvelop` (Hermod.Mail builders — HTML, multipart, attachments, PGP), serializes it, fans recipients out per domain, enqueues |
+| `MailSender` | `MailSender.cs` | MTA outbound entry point for typed `EMail`/`EMailEnvelop` (Hermod.Mail builders): `SendAsync` = queued "letter" delivery; `SendDirectAsync` = synchronous direct-to-MX with a per-domain `SendResult` |
+| `IMailSubmitter` / `MailSubmitter` / `NullMailSubmitter` | `MailSubmitter.cs` | Submission (RFC 6409) entry point: hand a typed message to a configured relay/submission server (STARTTLS + SASL AUTH), synchronous, returns a status — the interface an app injects for transactional mail |
 | `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay (raw-string `SendAsync` is `internal`) |
 | `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue, retries, DSN bounces |
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
@@ -304,25 +305,49 @@ still trust them after SPF/DKIM break in transit.
 
 ### Sending mail
 
-Compose with the rich `Hermod.Mail` builders (HTML, multipart, attachments,
-OpenPGP), then hand the typed message to **`MailSender`** — the single public
-send entry point. It serializes the message, splits recipients per domain, and
-enqueues them; a running `QueueProcessor` does the actual MX/TLS/DANE delivery.
+Always **compose** with the rich `Hermod.Mail` builders (HTML, multipart,
+attachments, OpenPGP) — those produce a typed `EMail`/`EMailEnvelop`. Then choose
+**how** it leaves the host by the *delivery guarantee you need*, not by topology:
+
+| Mode | API | Semantics — what you get back | "Accepted now" means |
+|------|-----|-------------------------------|----------------------|
+| **① Letter** | `MailSender.SendAsync` | Fire into the queue; delivered eventually in the background; failures surface **later** as a DSN bounce to the sender | *(nothing synchronous — you learn of failure via a bounce)* |
+| **② Submission receipt** | `MailSubmitter.SubmitAsync` | Synchronous; you get your **relay's** verdict now (`MailSubmissionResult`) | *your outgoing server* accepted it — it still delivers onward later |
+| **③ Hand-delivered** | `MailSender.SendDirectAsync` | Synchronous direct-to-MX; you get the **recipient MX's** verdict now (`SendResult` per domain) | *the recipient's mail server* accepted it right now |
+
+Rule of thumb: **bulk/newsletter/notifications → ①**; **an app sending transactional
+mail through its outgoing server (the usual case) → ②**; **you must know the
+recipient's server took a critical mail (password / contract) this instant, and
+your host may deliver directly → ③**.
 
 ```csharp
-var mail = new HTMLEMailBuilder {
-    Subject = "Rechnung", HTMLText = "<h1>Hallo</h1>", PlainText = "Hallo",
-};
+var mail = new HTMLEMailBuilder { Subject = "…", HTMLText = "…", PlainText = "…" };
 mail.From = SimpleEMailAddress.Parse("me@example.com");
 mail.To   = (EMailAddress) SimpleEMailAddress.Parse("you@example.org");
 mail.AddAttachment(pdfBytes, "rechnung.pdf");
 
-await new MailSender(mailQueue, logger).SendAsync(mail);   // builder → EMail (implicit)
+// ① Letter — queue; a running QueueProcessor does MX/TLS/DANE delivery, bounces on failure.
+await new MailSender(mailQueue, logger).SendAsync(mail);
+
+// ② Submission — hand to my outgoing server (STARTTLS + AUTH), know its verdict now.
+IMailSubmitter mailer = new MailSubmitter(
+    new MailSubmitterConfig("smtp.example.com", RelayPort: 587,
+                            Username: "app", Password: "…", RequireTls: true),
+    dnsClient, logger);
+var r2 = await mailer.SubmitAsync(mail);           // NullMailSubmitter for tests / no-mail
+if (!r2.IsOk) { /* r2.Status, r2.ResponseCode, r2.ResponseText */ }
+
+// ③ Hand-delivered — direct to the recipient's MX, synchronous, per-domain verdict now.
+var sender = new MailSender(mailQueue, logger, DirectDeliveryClient: outboundClient);
+var r3 = await sender.SendDirectAsync(mail);
+if (!r3.All(d => d.IsOk)) { /* d.TargetDomain, d.Result.ResponseCode, d.Result.ResponseText */ }
 ```
 
-The raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and hand-crafting a
-`QueuedMail`) are `internal`, so callers cannot enqueue an unchecked message
-string — everything goes through the typed `MailSender`.
+`IMailSubmitter` is interface-based (with `NullMailSubmitter`) on purpose, so it
+can replace the legacy `ISMTPClient` in consumers like Hermod's HTTP API. The
+raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and hand-crafting a
+`QueuedMail`) are `internal`, so a caller cannot inject an unchecked message
+string — everything goes through the typed facades above.
 
 ---
 
