@@ -77,6 +77,33 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         public          Boolean  RequireAuthOnSubmission    { get; init; } = true;
 
 
+        #region DMARC reporting (RFC 7489 §7)
+
+        /// <summary>
+        /// Emit DMARC aggregate (RUA) reports for domains that request them. Off by default:
+        /// a receiver is not required to send reports, and doing so needs a working outbound
+        /// path and a domain identity the reports can be DKIM-aligned with.
+        /// </summary>
+        public          Boolean   EnableDmarcReporting       { get; init; } = false;
+
+        /// <summary>
+        /// Also emit DMARC forensic (RUF/failure) reports. Separate opt-in because forensic
+        /// reports contain message content and are privacy-sensitive (RFC 7489 §7.3).
+        /// </summary>
+        public          Boolean   EnableDmarcForensic        { get; init; } = false;
+
+        /// <summary>How often aggregate reports are generated (RFC 7489 default 86400 s).</summary>
+        public          TimeSpan  DmarcReportInterval        { get; init; } = TimeSpan.FromHours(24);
+
+        /// <summary>org_name reported in aggregate reports. Defaults to <see cref="Hostname"/>.</summary>
+        public          String?   DmarcReportOrgName         { get; init; }
+
+        /// <summary>From/contact address for outgoing reports. Defaults to postmaster@&lt;hostname&gt;.</summary>
+        public          String?   DmarcReportEmail           { get; init; }
+
+        #endregion
+
+
 
         /// <summary>
         /// Check if a domain is local (case-insensitive)

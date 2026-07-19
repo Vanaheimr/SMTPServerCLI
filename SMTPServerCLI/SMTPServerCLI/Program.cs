@@ -63,7 +63,13 @@ var smtpServerConfig  = new SMTPServerConfig {
                             // Mail to other domains requires authentication (relay)
                             LocalDomains             = ParseLocalDomains(Environment.GetEnvironmentVariable("SMTP_LOCAL_DOMAINS") ?? hostname),
                             RequireAuthForRelay      = true,   // MUST be true to prevent open relay!
-                            RequireAuthOnSubmission  = true
+                            RequireAuthOnSubmission  = true,
+
+                            // DMARC reporting (RFC 7489 §7) - opt-in
+                            EnableDmarcReporting     = Environment.GetEnvironmentVariable("DMARC_REPORTING") == "true",
+                            EnableDmarcForensic      = Environment.GetEnvironmentVariable("DMARC_FORENSIC")  == "true",
+                            DmarcReportEmail         = Environment.GetEnvironmentVariable("DMARC_REPORT_EMAIL"),
+                            DmarcReportOrgName       = Environment.GetEnvironmentVariable("DMARC_REPORT_ORG")
 
                         };
 
@@ -159,6 +165,7 @@ Console.WriteLine($"""
       Verify SPF:     {smtpServerConfig.VerifySpf}
       Verify DMARC:   {smtpServerConfig.VerifyDmarc}
       DKIM Signing:   {dkimSigner is not null}
+      DMARC Reports:  {(smtpServerConfig.EnableDmarcReporting ? $"on (forensic={smtpServerConfig.EnableDmarcForensic})" : "off")}
       Smarthost:      {outboundConfig.SmartHost ?? "(direct delivery)"}
       Relay Auth:     Required (prevents open relay)
     """);

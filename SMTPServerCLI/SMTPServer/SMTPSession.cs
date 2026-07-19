@@ -50,7 +50,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                     ConnectionTracker?  connectionTracker,
                                     RateLimitConfig     rateLimitConfig,
                                     ILogger             logger,
-                                    Boolean             implicitTls = false)
+                                    Boolean             implicitTls        = false,
+                                    DmarcReportService? dmarcReportService = null)
     {
 
         private Stream                         _stream         = client.GetStream();
@@ -825,6 +826,25 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 LogVerificationResult(verification);
 
+                // === DMARC REPORTING (RFC 7489 §7) ===
+                // Record every DMARC-evaluated message (pass or fail) for aggregate reports;
+                // fire a forensic report for failures. Done here so it runs on all paths,
+                // including the reject/quarantine early-returns below. The disposition is
+                // already baked into the evaluation by the verifier.
+                if (verification.DmarcDetail is { } dmarcEval)
+                {
+                    dmarcReportService?.RecordInbound(dmarcEval, _clientIp);
+
+                    if (dmarcEval.Failed && dmarcReportService is not null)
+                    {
+                        var headerBlock = ExtractHeaderBlock(rawMessage);
+                        var authResults = $"{config.Hostname}; dmarc=fail header.from={dmarcEval.HeaderFromDomain}";
+                        // Fire-and-forget: forensic sending does a DNS consent lookup we don't
+                        // want to block the inbound DATA acknowledgement on.
+                        _ = dmarcReportService.SendForensicAsync(dmarcEval, _clientIp, headerBlock, _mailFrom ?? "", authResults, ct);
+                    }
+                }
+
                 // === SPF HARD-FAIL REJECT ===
                 if (verification.Spf == SPFResult.Fail)
                 {
@@ -1058,6 +1078,16 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
             var atIndex = email.IndexOf('@');
             return atIndex > 0 ? email[(atIndex + 1)..] : "";
+        }
+
+        // The header block of a raw message (everything up to the first empty line), used for
+        // the headers-only body of a DMARC forensic (ARF) report.
+        private static string ExtractHeaderBlock(string rawMessage)
+        {
+            var split = rawMessage.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            if (split < 0)
+                split = rawMessage.IndexOf("\n\n", StringComparison.Ordinal);
+            return split > 0 ? rawMessage[..split] : rawMessage;
         }
 
         private async Task HandleRsetAsync()

@@ -52,6 +52,7 @@ reference implementations.
 | `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue, retries, DSN bounces |
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
+| `DmarcReportService` + `DmarcAggregator` | `Reporting/` | RFC 7489 §7 aggregate (RUA) + forensic (RUF/ARF) report generation |
 
 All DNS lookups (TXT, MX, A/AAAA, PTR, MTA-STS) go through the injected Hermod
 `DNSClient` — there are no `nslookup`/`dig` subprocesses or `System.Net.Dns`
@@ -193,9 +194,25 @@ written into an `Authentication-Results` header
   List** snapshot (`DNSVerifications/public_suffix_list.dat`; validated against
   all official `test_psl.txt` vectors), so multi-label suffixes like `co.uk` and
   private suffixes like `github.io` are handled correctly.
-- **Not yet implemented:** aggregate/forensic **report generation** (`rua`/`ruf`).
-  The tags are parsed but no reports are emitted — this does not affect inbound
-  enforcement.
+
+**Reporting (RFC 7489 §7) — opt-in (`EnableDmarcReporting`).** Off by default; a
+receiver is not required to send reports.
+
+- **Aggregate (RUA):** every DMARC-evaluated message is counted, grouped by policy
+  domain and by source IP + authentication results (`Reporting/DmarcAggregator.cs`,
+  persisted to `dmarc-reports/aggregate-state.json` so counts survive a restart).
+  Once per interval (default 24 h) a report is generated as RFC 7489 Appendix-C
+  XML (`DmarcReportXml`), gzipped into a MIME message with the standard
+  `receiver!domain!begin!end.xml.gz` attachment and `Report Domain: … Report-ID: …`
+  subject, and enqueued through the normal outbound queue — which DKIM-signs it,
+  so the report itself is DMARC-aligned.
+- **Forensic (RUF):** a separate opt-in (`EnableDmarcForensic`, privacy-sensitive).
+  Failing messages produce an ARF report (RFC 6591) containing the offending
+  message's **headers only**, rate-limited per domain.
+- **External-destination consent (§7.1):** before sending to an `rua`/`ruf`
+  address outside the policy domain's organizational domain, a
+  `<policy-domain>._report._dmarc.<dest>` `v=DMARC1` record is required, else the
+  destination is skipped.
 
 ---
 
@@ -239,7 +256,8 @@ written into an `Authentication-Results` header
 | 6376 | DKIM | ✅ complete, cross-validated |
 | 8601 | Authentication-Results | ✅ |
 | 7435 | Opportunistic security (TLS) | ✅ outbound cert policy |
-| 7489 | DMARC | ✅ identifier alignment + PSL; ⚠️ no `rua`/`ruf` reports |
+| 7489 | DMARC | ✅ alignment + PSL + `rua`/`ruf` report generation |
+| 6591 | ARF (forensic reports) | ✅ (RUF) |
 | 2920 | PIPELINING | ✅ |
 | 8314 | Implicit TLS (port 465) | ✅ implicit-TLS submission |
 | 8617 | ARC | ❌ not implemented |
@@ -263,6 +281,7 @@ scratchpad (`dnstest/`, `pgp_smtp_test.py`, `dkim_sign.py`, `dkim_verify.py`).
 | **Outbound TLS** | Tested against our own self-signed server: opportunistic → `Success 250`; strict → `TempFail 454`. |
 | **Implicit TLS (465)** | A real `SslStream` client handshakes from the first byte, receives the `220` greeting and `EHLO` response over TLS, and confirms `STARTTLS` is not advertised while `AUTH PLAIN/LOGIN` is; the plaintext 587 port still advertises `STARTTLS`. |
 | **PIPELINING** | A client sends `MAIL`/`RCPT`/`DATA` as one socket write (and, in a second test, the entire `EHLO`…`DATA`…body…`QUIT` session in a single write); all replies come back in order and both messages land on disk. |
+| **DMARC reporting** | Aggregator grouping/counts + JSON persistence across restart; the full send pipeline (MIME + gzip + external-dest consent) through a fake queue; the gzipped attachment is gunzipped and the RFC 7489 XML is parsed and asserted (policy, per-row counts, alignment, `header_from`, `auth_results`); ARF forensic report structure + hourly rate limit. |
 
 ---
 
@@ -283,6 +302,10 @@ Configured via environment variables (see `SMTPServerCLI/Program.cs`):
 | `DKIM_AUTO_GENERATE` | – | `true` → generate a keypair if none exists |
 | `SMTP_SMARTHOST` | – | Optional relay host for outbound |
 | `SMTP_SMARTHOST_PORT` / `_USER` / `_PASS` | `25` / – / – | Smarthost port & credentials |
+| `DMARC_REPORTING` | – | `true` → emit DMARC aggregate (RUA) reports |
+| `DMARC_FORENSIC` | – | `true` → also emit DMARC forensic (RUF/ARF) reports |
+| `DMARC_REPORT_EMAIL` | `dmarc-reports@<hostname>` | From/return-path for reports (its domain must be DKIM-signable) |
+| `DMARC_REPORT_ORG` | `<hostname>` | `org_name` in aggregate reports |
 
 Ports default to 2525/2587 so the server runs without root. A self-signed TLS
 certificate (`server.pfx`) and default users (`admin`/`user` = `test123`,
@@ -404,10 +427,6 @@ Send a test message to a Gmail account and read the *Show original* →
 
 Honest list of what stands between this and a production Internet MX:
 
-- **DMARC reports are not generated** — identifier alignment and policy
-  enforcement are implemented (with an embedded Public Suffix List), but no
-  aggregate (`rua`) or forensic (`ruf`) reports are emitted. This is a
-  good-neighbour feature and does not affect inbound anti-spoofing enforcement.
 - **No anti-spam / anti-abuse** — no greylisting, DNSBL/RBL, SpamAssassin/rspamd
   integration, or reputation. An open MX is attacked immediately.
 - **Catch-all recipients** — any address at a local domain is accepted; there is
@@ -430,8 +449,6 @@ core it is designed to be.
 
 ## Not implemented / roadmap
 
-- DMARC aggregate/forensic (`rua`/`ruf`) report generation. _(Identifier
-  alignment and the Public Suffix List are now implemented.)_
 - ARC ([RFC 8617](https://www.rfc-editor.org/rfc/rfc8617)) for forwarding.
 - TLS-RPT (RFC 8460).
 - DANE / TLSA ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672)).

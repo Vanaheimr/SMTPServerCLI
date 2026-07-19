@@ -69,7 +69,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 dmarc.Result,
                 dmarc.Policy,
                 mxTask.Result,
-                dkimTask.Result.Domain
+                dkimTask.Result.Domain,
+                dmarc.Detail
             );
 
         }
@@ -615,7 +616,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         /// <param name="spfResult">The SPF result.</param>
         /// <param name="dkimResult">The DKIM result.</param>
         /// <param name="dkimDomain">The d= domain of the evaluated (passing) DKIM signature.</param>
-        private async Task<(DmarcResult Result, string? Policy)> VerifyDmarcAsync(
+        private async Task<(DmarcResult Result, string? Policy, DmarcEvaluation? Detail)> VerifyDmarcAsync(
             string            fromDomain,
             string            spfAuthDomain,
             SPFResult         spfResult,
@@ -626,11 +627,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             try
             {
                 if (string.IsNullOrEmpty(fromDomain))
-                    return (DmarcResult.None, null);
+                    return (DmarcResult.None, null, null);
 
                 // DMARC record for the From domain itself, else the organizational domain
                 // (RFC 7489 §6.6.3). The org-domain record's sp= governs sub-domains.
                 var record        = await GetTxtRecordAsync($"_dmarc.{fromDomain}", "v=DMARC1", ct);
+                var policyDomain  = fromDomain;
                 var usedOrgRecord = false;
 
                 if (record is null)
@@ -639,12 +641,13 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (!orgDomain.Equals(fromDomain, StringComparison.OrdinalIgnoreCase))
                     {
                         record        = await GetTxtRecordAsync($"_dmarc.{orgDomain}", "v=DMARC1", ct);
+                        policyDomain  = orgDomain;
                         usedOrgRecord = true;
                     }
                 }
 
                 if (record is null)
-                    return (DmarcResult.None, null);
+                    return (DmarcResult.None, null, null);
 
                 Logger.Log(LogLevel.Debug, $"DMARC record for {fromDomain}: {record}");
 
@@ -657,16 +660,44 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 var spfAligned  = spfResult  == SPFResult.Pass  && IsAligned(spfAuthDomain, fromDomain, dmarc.StrictSpf);
                 var dkimAligned = dkimResult == DkimResult.Pass && IsAligned(dkimDomain,    fromDomain, dmarc.StrictDkim);
 
-                if (spfAligned || dkimAligned)
-                    return (DmarcResult.Pass, policy);
+                var pass            = spfAligned || dkimAligned;
+                var effectivePolicy = pass ? policy : ApplyPct(policy, dmarc.Percent);
+                var disposition     = !pass
+                                          ? effectivePolicy switch {
+                                                "reject"     => DmarcDisposition.Reject,
+                                                "quarantine" => DmarcDisposition.Quarantine,
+                                                _            => DmarcDisposition.None
+                                            }
+                                          : DmarcDisposition.None;
 
-                // Failing: pct sampling downgrades the enforced policy (RFC 7489 §6.6.4).
-                return (DmarcResult.Fail, ApplyPct(policy, dmarc.Percent));
+                var detail = new DmarcEvaluation(
+                    HeaderFromDomain: fromDomain,
+                    PolicyDomain:     policyDomain,
+                    RequestedPolicy:  dmarc.Policy,
+                    SubdomainPolicy:  dmarc.SubdomainPolicy,
+                    EffectivePolicy:  effectivePolicy,
+                    Percent:          dmarc.Percent,
+                    StrictSpf:        dmarc.StrictSpf,
+                    StrictDkim:       dmarc.StrictDkim,
+                    Rua:              dmarc.Rua,
+                    Ruf:              dmarc.Ruf,
+                    FailureOptions:   dmarc.FailureOptions,
+                    SpfResult:        spfResult,
+                    SpfDomain:        string.IsNullOrEmpty(spfAuthDomain) ? null : spfAuthDomain,
+                    SpfAligned:       spfAligned,
+                    DkimResult:       dkimResult,
+                    DkimDomain:       dkimDomain,
+                    DkimAligned:      dkimAligned,
+                    Result:           pass ? DmarcResult.Pass : DmarcResult.Fail,
+                    Disposition:      disposition
+                );
+
+                return (detail.Result, effectivePolicy, detail);
             }
             catch (Exception ex)
             {
                 Logger.Log(LogLevel.Warning, $"DMARC verification error for {fromDomain}: {ex.Message}");
-                return (DmarcResult.TempError, null);
+                return (DmarcResult.TempError, null, null);
             }
         }
 
@@ -709,8 +740,29 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             bool    StrictDkim,
             int     Percent,
             string? Rua,
-            string? Ruf
+            string? Ruf,
+            string? FailureOptions
         );
+
+        /// <summary>
+        /// RFC 7489 §7.1: before sending a report to a destination outside the policy domain's
+        /// organizational domain, verify the destination has consented by publishing a
+        /// "v=DMARC1" TXT record at <c>&lt;policy-domain&gt;._report._dmarc.&lt;destination&gt;</c>.
+        /// Destinations within the same organizational domain are authorized implicitly.
+        /// </summary>
+        public async Task<bool> IsExternalReportingAuthorizedAsync(
+            string            policyDomain,
+            string            destinationDomain,
+            CancellationToken ct = default)
+        {
+            if (PublicSuffixList.GetOrganizationalDomain(policyDomain)
+                    .Equals(PublicSuffixList.GetOrganizationalDomain(destinationDomain), StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var authName = $"{policyDomain}._report._dmarc.{destinationDomain}";
+            var record   = await GetTxtRecordAsync(authName, "v=DMARC1", ct);
+            return record is not null;
+        }
 
         private static DmarcRecord ParseDmarcRecord(string record)
         {
@@ -739,7 +791,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 Strict("adkim"),
                 percent,
                 tags.GetValueOrDefault("rua"),
-                tags.GetValueOrDefault("ruf")
+                tags.GetValueOrDefault("ruf"),
+                tags.GetValueOrDefault("fo")
             );
         }
 

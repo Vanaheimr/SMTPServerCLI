@@ -26,7 +26,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         DmarcResult Dmarc,
         String?     DmarcPolicy,
         String[]    MxRecords,
-        String?     DkimDomain = null   // the d= tag of the evaluated DKIM signature
+        String?           DkimDomain = null,   // the d= tag of the evaluated DKIM signature
+        DmarcEvaluation?  DmarcDetail = null   // full DMARC outcome for policy + reporting (RFC 7489 §7)
     );
 
 }

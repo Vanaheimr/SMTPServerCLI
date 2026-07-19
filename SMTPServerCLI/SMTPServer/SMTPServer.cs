@@ -41,6 +41,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private readonly IMailQueue?                 _mailQueue;
         private readonly ConnectionTracker           _connectionTracker;
         private readonly X509Certificate2?           _certificate;
+        private readonly DmarcReportService?         _dmarcReportService;
         private readonly ILogger                     _logger;
         private readonly ConcurrentBag<TcpListener>  _listeners    = [];
         private readonly ConcurrentBag<Task>         _sessionTasks = [];
@@ -74,6 +75,31 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 _logger.Log(LogLevel.Info, $"Loaded certificate: {_certificate.Subject}");
 
+            }
+
+            // DMARC reporting (RFC 7489 §7) — opt-in, and only when there is an outbound queue
+            // to send the reports through.
+            if (ServerConfig.EnableDmarcReporting && _mailQueue is not null)
+            {
+                var reportEmail     = ServerConfig.DmarcReportEmail ?? $"dmarc-reports@{ServerConfig.Hostname}";
+                var reportingDomain = DmarcReportService.AddressDomain(reportEmail);
+                if (reportingDomain.Length == 0)
+                    reportingDomain = ServerConfig.Hostname;
+
+                var aggregator = new DmarcAggregator(
+                                     Path.Combine(ServerConfig.MailStoragePath, "dmarc-reports", "aggregate-state.json"),
+                                     _logger);
+
+                var options = new DmarcReportingOptions(
+                    OrgName:           ServerConfig.DmarcReportOrgName ?? ServerConfig.Hostname,
+                    ReportFromDisplay: $"DMARC Reports <{reportEmail}>",
+                    ReportFromAddress: reportEmail,
+                    ReportingDomain:   reportingDomain,
+                    Interval:          ServerConfig.DmarcReportInterval,
+                    EnableForensic:    ServerConfig.EnableDmarcForensic);
+
+                _dmarcReportService = new DmarcReportService(aggregator, _mailQueue, _dnsVerifier, options, _logger);
+                _logger.Log(LogLevel.Info, $"DMARC reporting enabled (from {reportEmail}, forensic={ServerConfig.EnableDmarcForensic})");
             }
 
         }
@@ -125,6 +151,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             {
                 _logger.Log(LogLevel.Warning, $"Implicit-TLS port {serverConfig.ImplicitTlsPort} not bound: no certificate configured");
             }
+
+            // DMARC aggregate-report generation loop (RFC 7489 §7.2).
+            if (_dmarcReportService is not null)
+                _ = _dmarcReportService.RunAsync(_cts.Token);
 
             _logger.Log(LogLevel.Info, "Server started. Waiting for connections...");
 
@@ -215,7 +245,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                         _connectionTracker,
                                         _rateLimitConfig,
                                         _logger,
-                                        implicitTls
+                                        implicitTls,
+                                        _dmarcReportService
                                     );
 
                     var task      = session.HandleAsync(ct);
