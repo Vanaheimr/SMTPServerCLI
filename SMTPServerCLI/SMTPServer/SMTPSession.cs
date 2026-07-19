@@ -1011,6 +1011,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 _                     => "none"
             };
 
+            static String Arc(ArcResult r) => r switch {
+                ArcResult.Pass => "pass",
+                ArcResult.Fail => "fail",
+                _              => "none"
+            };
+
             var mailFrom     = String.IsNullOrEmpty(_mailFrom) ? "<>" : _mailFrom;
             var dmarcComment = v.DmarcPolicy is not null ? $" (p={v.DmarcPolicy})" : "";
             var fromDom      = String.IsNullOrEmpty(fromDomain) ? senderDomain : fromDomain;
@@ -1020,10 +1026,14 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                    ? $"dkim={Dkim(v.Dkim)} header.d={v.DkimDomain}"
                                    : $"dkim={Dkim(v.Dkim)}";
 
+            // arc= reflects the received-chain validation status (RFC 8617 §4.1.1); omitted
+            // when the message carries no ARC headers.
+            var arcClause = v.Arc != ArcResult.None ? $";\r\n\tarc={Arc(v.Arc)}" : "";
+
             return $"Authentication-Results: {config.Hostname};\r\n" +
                    $"\tspf={Spf(v.Spf)} smtp.mailfrom={mailFrom};\r\n" +
                    $"\t{dkimClause};\r\n" +
-                   $"\tdmarc={Dmarc(v.Dmarc)} header.from={fromDom}{dmarcComment}\r\n";
+                   $"\tdmarc={Dmarc(v.Dmarc)} header.from={fromDom}{dmarcComment}{arcClause}\r\n";
 
         }
 

@@ -53,6 +53,7 @@ reference implementations.
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
 | `DmarcReportService` + `DmarcAggregator` | `Reporting/` | RFC 7489 §7 aggregate (RUA) + forensic (RUF/ARF) report generation |
+| `ArcValidator` + `ArcSealer` + `ArcChain` | `Arc/` | RFC 8617 Authenticated Received Chain validation and sealing |
 
 All DNS lookups (TXT, MX, A/AAAA, PTR, MTA-STS) go through the injected Hermod
 `DNSClient` — there are no `nslookup`/`dig` subprocesses or `System.Net.Dns`
@@ -214,6 +215,25 @@ receiver is not required to send reports.
   `<policy-domain>._report._dmarc.<dest>` `v=DMARC1` record is required, else the
   destination is skipped.
 
+### ARC — [RFC 8617](https://www.rfc-editor.org/rfc/rfc8617) ✅
+
+The Authenticated Received Chain lets a forwarder record the authentication
+results it saw and cryptographically seal them, so a downstream receiver can
+still trust them after SPF/DKIM break in transit.
+
+- **Validation** (`Arc/ArcValidator.cs`) runs on every inbound message and the
+  result is reported as `arc=pass|fail|none` in `Authentication-Results`. It
+  verifies the newest `ARC-Message-Signature` against the message, verifies every
+  `ARC-Seal`, and enforces the cv chain (i=1 → `none`, i>1 → `pass`). The AMS is a
+  DKIM-style signature, so it reuses the shared DKIM canonicalizer; the AS signs
+  the relaxed-canonicalized chain (`ArcChain.BuildSealSigningInput`).
+- **Sealing** (`Arc/ArcSealer.cs`) adds a new ARC set (AAR + AMS + AS) extending
+  the chain. It is provided as a component for a forwarding deployment; the server
+  does not auto-seal originated mail (sealing is an intermediary function).
+- Both directions are **cross-validated against Python `dkimpy`**: dkimpy verifies
+  our 1- and 2-hop sealed chains as `cv=pass`, and our validator accepts a
+  dkimpy-sealed message.
+
 ---
 
 ## Message handling
@@ -260,7 +280,7 @@ receiver is not required to send reports.
 | 6591 | ARF (forensic reports) | ✅ (RUF) |
 | 2920 | PIPELINING | ✅ |
 | 8314 | Implicit TLS (port 465) | ✅ implicit-TLS submission |
-| 8617 | ARC | ❌ not implemented |
+| 8617 | ARC | ✅ chain validation + sealing, cross-validated with dkimpy |
 
 ---
 
@@ -282,6 +302,7 @@ scratchpad (`dnstest/`, `pgp_smtp_test.py`, `dkim_sign.py`, `dkim_verify.py`).
 | **Implicit TLS (465)** | A real `SslStream` client handshakes from the first byte, receives the `220` greeting and `EHLO` response over TLS, and confirms `STARTTLS` is not advertised while `AUTH PLAIN/LOGIN` is; the plaintext 587 port still advertises `STARTTLS`. |
 | **PIPELINING** | A client sends `MAIL`/`RCPT`/`DATA` as one socket write (and, in a second test, the entire `EHLO`…`DATA`…body…`QUIT` session in a single write); all replies come back in order and both messages land on disk. |
 | **DMARC reporting** | Aggregator grouping/counts + JSON persistence across restart; the full send pipeline (MIME + gzip + external-dest consent) through a fake queue; the gzipped attachment is gunzipped and the RFC 7489 XML is parsed and asserted (policy, per-row counts, alignment, `header_from`, `auth_results`); ARF forensic report structure + hourly rate limit. |
+| **ARC** | Cross-validated **both directions** with Python **`dkimpy`**: dkimpy verifies our 1-hop and 2-hop sealed chains (`cv=pass`), and our validator accepts a dkimpy-sealed message. Plus self-tests: seal↔validate round-trip, 2-hop chain, body/seal tamper detection, and cv-chain enforcement. |
 
 ---
 
@@ -449,7 +470,6 @@ core it is designed to be.
 
 ## Not implemented / roadmap
 
-- ARC ([RFC 8617](https://www.rfc-editor.org/rfc/rfc8617)) for forwarding.
 - TLS-RPT (RFC 8460).
 - DANE / TLSA ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672)).
 - SPF `exp=` explanation strings and the `ptr` mechanism.

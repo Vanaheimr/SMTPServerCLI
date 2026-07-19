@@ -46,8 +46,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             var spfTask   = VerifySpfAsync(senderDomain, clientIp, mailFrom, heloHostname, ct);
             var dkimTask  = VerifyDkimAsync(message, ct);
             var mxTask    = GetMxRecordsAsync(senderDomain, ct);
+            var arcTask   = VerifyArcAsync(message, ct);
 
-            await Task.WhenAll(spfTask, dkimTask, mxTask);
+            await Task.WhenAll(spfTask, dkimTask, mxTask, arcTask);
 
             // DMARC is anchored on the RFC5322.From domain (RFC 7489 §6.6.1) and needs the
             // SPF/DKIM results to compute identifier alignment, so it runs after the others.
@@ -70,7 +71,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 dmarc.Policy,
                 mxTask.Result,
                 dkimTask.Result.Domain,
-                dmarc.Detail
+                dmarc.Detail,
+                arcTask.Result
             );
 
         }

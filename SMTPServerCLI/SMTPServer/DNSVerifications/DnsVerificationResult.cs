@@ -27,7 +27,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         String?     DmarcPolicy,
         String[]    MxRecords,
         String?           DkimDomain = null,   // the d= tag of the evaluated DKIM signature
-        DmarcEvaluation?  DmarcDetail = null   // full DMARC outcome for policy + reporting (RFC 7489 §7)
+        DmarcEvaluation?  DmarcDetail = null,  // full DMARC outcome for policy + reporting (RFC 7489 §7)
+        ArcResult         Arc = ArcResult.None // Authenticated Received Chain status (RFC 8617)
     );
 
 }
