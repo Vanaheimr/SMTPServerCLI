@@ -103,6 +103,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         #endregion
 
+        #region TLS-RPT ingestion (RFC 8460)
+
+        /// <summary>
+        /// Ingest inbound SMTP TLS Reporting (TLS-RPT) reports delivered to our <c>_smtp._tls</c>
+        /// <c>rua</c> mailbox: detect them, decompress + parse the RFC 8460 JSON, persist and log
+        /// a summary. Off by default.
+        /// </summary>
+        public          Boolean   EnableTlsRptIngestion      { get; init; } = false;
+
+        #endregion
+
 
 
         /// <summary>

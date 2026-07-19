@@ -54,6 +54,7 @@ reference implementations.
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
 | `DaneResolver` + `DaneAuthenticator` | `Dane.cs` | RFC 7672 DNSSEC-validated TLSA lookup + certificate matching |
 | `TlsRptResolver` + `TlsRptAggregator` + `TlsRptReportService` | `Reporting/TlsRptReporting.cs` | RFC 8460 SMTP TLS Reporting (outbound TLS success/failure aggregate reports) |
+| `TlsRptIngestor` | `Reporting/TlsRptIngestion.cs` | RFC 8460 inbound report ingestion (decompress + parse TLS reports we receive) |
 | `DmarcReportService` + `DmarcAggregator` | `Reporting/` | RFC 7489 §7 aggregate (RUA) + forensic (RUF/ARF) report generation |
 | `ArcValidator` + `ArcSealer` + `ArcChain` | `Arc/` | RFC 8617 Authenticated Received Chain validation and sealing |
 
@@ -175,6 +176,13 @@ production.
   builds the RFC 8460 §4 JSON, gzips it into an `application/tlsrpt+gzip`
   `multipart/report`, and enqueues it through the outbound queue (DKIM-signed).
   Counts are persisted so they survive a restart.
+
+  The **inbound** direction (opt-in via `TLSRPT_INGEST=true`) is handled by
+  `TlsRptIngestor`: a message delivered to our `_smtp._tls` `rua` mailbox is
+  detected (`report-type="tlsrpt"` / `application/tlsrpt` / `TLS-Report-Domain`),
+  its `application/tlsrpt+gzip` (or `+json`) part is base64-decoded and gunzipped,
+  the RFC 8460 §4 JSON is parsed, the raw report is stored under
+  `<mailstore>/tls-reports-received/`, and a success/failure summary is logged.
 - **REQUIRETLS** ([RFC 8689](https://www.rfc-editor.org/rfc/rfc8689)): honored on
   `MAIL FROM` and propagated to enforced outbound delivery.
 
@@ -302,7 +310,7 @@ still trust them after SPF/DKIM break in transit.
 | 6409 | Message submission | ✅ (auth required on 587) |
 | 8689 | REQUIRETLS | ✅ |
 | 8461 | MTA-STS | ✅ |
-| 8460 | TLS-RPT (SMTP TLS Reporting) | ✅ outbound aggregate reports (opt-in) |
+| 8460 | TLS-RPT (SMTP TLS Reporting) | ✅ outbound reports + inbound ingestion (opt-in) |
 | 7208 | SPF (incl. macros §7) | ✅ complete |
 | 6376 | DKIM | ✅ complete, cross-validated |
 | 8601 | Authentication-Results | ✅ |
@@ -360,6 +368,7 @@ Configured via environment variables (see `SMTPServerCLI/Program.cs`):
 | `TLSRPT_REPORTING` | – | `true` → emit outbound SMTP TLS Reporting (RFC 8460) aggregate reports |
 | `TLSRPT_REPORT_EMAIL` | `tls-reports@<hostname>` | From/return-path for TLS reports |
 | `TLSRPT_REPORT_ORG` | `<hostname>` | `organization-name` in TLS reports |
+| `TLSRPT_INGEST` | – | `true` → ingest inbound TLS-RPT reports (parse + store under `tls-reports-received/`) |
 | `DMARC_REPORTING` | – | `true` → emit DMARC aggregate (RUA) reports |
 | `DMARC_FORENSIC` | – | `true` → also emit DMARC forensic (RUF/ARF) reports |
 | `DMARC_REPORT_EMAIL` | `dmarc-reports@<hostname>` | From/return-path for reports (its domain must be DKIM-signable) |

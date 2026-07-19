@@ -51,7 +51,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                     RateLimitConfig     rateLimitConfig,
                                     ILogger             logger,
                                     Boolean             implicitTls        = false,
-                                    DmarcReportService? dmarcReportService = null)
+                                    DmarcReportService? dmarcReportService = null,
+                                    TlsRptIngestor?     tlsRptIngestor     = null)
     {
 
         private Stream                         _stream         = client.GetStream();
@@ -923,6 +924,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             {
                 filePath = await storage.StoreAsync(stampedMessage, _mailFrom ?? "<>", _localRcptTo, ct);
                 logger.Log(LogLevel.Info, $"Stored locally: {Path.GetFileName(filePath)}");
+
+                // TLS-RPT (RFC 8460) inbound: if this is a TLS report delivered to our rua
+                // mailbox, decompress + parse it and record a summary (best-effort side effect).
+                if (tlsRptIngestor is not null && TlsRptIngestor.IsTlsRptReport(stampedMessage))
+                    tlsRptIngestor.Ingest(stampedMessage);
             }
 
             // Queue for outbound delivery for remote recipients (relay)

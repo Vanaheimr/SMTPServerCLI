@@ -69,7 +69,10 @@ var smtpServerConfig  = new SMTPServerConfig {
                             EnableDmarcReporting     = Environment.GetEnvironmentVariable("DMARC_REPORTING") == "true",
                             EnableDmarcForensic      = Environment.GetEnvironmentVariable("DMARC_FORENSIC")  == "true",
                             DmarcReportEmail         = Environment.GetEnvironmentVariable("DMARC_REPORT_EMAIL"),
-                            DmarcReportOrgName       = Environment.GetEnvironmentVariable("DMARC_REPORT_ORG")
+                            DmarcReportOrgName       = Environment.GetEnvironmentVariable("DMARC_REPORT_ORG"),
+
+                            // TLS-RPT (RFC 8460) inbound report ingestion - opt-in
+                            EnableTlsRptIngestion    = Environment.GetEnvironmentVariable("TLSRPT_INGEST") == "true"
 
                         };
 
@@ -189,6 +192,7 @@ Console.WriteLine($"""
       Verify DMARC:   {smtpServerConfig.VerifyDmarc}
       DKIM Signing:   {dkimSigner is not null}
       DMARC Reports:  {(smtpServerConfig.EnableDmarcReporting ? $"on (forensic={smtpServerConfig.EnableDmarcForensic})" : "off")}
+      TLS-RPT Ingest: {(smtpServerConfig.EnableTlsRptIngestion ? "on (RFC 8460 inbound)" : "off")}
       Smarthost:      {outboundConfig.SmartHost ?? "(direct delivery)"}
       DANE (out):     {(outboundConfig.EnableDane ? "on (RFC 7672, DNSSEC TLSA)" : "off")}
       TLS-RPT (out):  {(tlsRptService is not null ? "on (RFC 8460)" : "off")}

@@ -42,6 +42,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private readonly ConnectionTracker           _connectionTracker;
         private readonly X509Certificate2?           _certificate;
         private readonly DmarcReportService?         _dmarcReportService;
+        private readonly TlsRptIngestor?             _tlsRptIngestor;
         private readonly ILogger                     _logger;
         private readonly ConcurrentBag<TcpListener>  _listeners    = [];
         private readonly ConcurrentBag<Task>         _sessionTasks = [];
@@ -100,6 +101,15 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 _dmarcReportService = new DmarcReportService(aggregator, _mailQueue, _dnsVerifier, options, _logger);
                 _logger.Log(LogLevel.Info, $"DMARC reporting enabled (from {reportEmail}, forensic={ServerConfig.EnableDmarcForensic})");
+            }
+
+            // TLS-RPT (RFC 8460) inbound report ingestion — opt-in.
+            if (ServerConfig.EnableTlsRptIngestion)
+            {
+                _tlsRptIngestor = new TlsRptIngestor(
+                                      Path.Combine(ServerConfig.MailStoragePath, "tls-reports-received"),
+                                      _logger);
+                _logger.Log(LogLevel.Info, "TLS-RPT inbound report ingestion enabled");
             }
 
         }
@@ -246,7 +256,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                         _rateLimitConfig,
                                         _logger,
                                         implicitTls,
-                                        _dmarcReportService
+                                        _dmarcReportService,
+                                        _tlsRptIngestor
                                     );
 
                     var task      = session.HandleAsync(ct);
