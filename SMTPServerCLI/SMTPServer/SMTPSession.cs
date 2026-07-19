@@ -842,7 +842,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             // Authentication-Results (RFC 8601) goes above the Received header of this hop.
             var traceHeaders = "";
             if (verification is not null)
-                traceHeaders += BuildAuthenticationResultsHeader(verification, senderDomain);
+                traceHeaders += BuildAuthenticationResultsHeader(verification, senderDomain, ExtractDomain(message.From ?? ""));
             traceHeaders += await BuildReceivedHeaderAsync(ct);
             if (dmarcQuarantine)
                 traceHeaders += "X-DMARC-Quarantine: true\r\n";
@@ -923,7 +923,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         /// Build an "Authentication-Results:" header for this hop (RFC 8601) from the
         /// SPF/DKIM/DMARC verification results. Returned terminated with CRLF.
         /// </summary>
-        private String BuildAuthenticationResultsHeader(DnsVerificationResult v, String senderDomain)
+        private String BuildAuthenticationResultsHeader(DnsVerificationResult v, String senderDomain, String? fromDomain)
         {
 
             static String Spf(SPFResult r) => r switch {
@@ -954,11 +954,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             var mailFrom     = String.IsNullOrEmpty(_mailFrom) ? "<>" : _mailFrom;
             var dmarcComment = v.DmarcPolicy is not null ? $" (p={v.DmarcPolicy})" : "";
+            var fromDom      = String.IsNullOrEmpty(fromDomain) ? senderDomain : fromDomain;
+
+            // header.d is only meaningful when a signature was actually evaluated.
+            var dkimClause   = v.DkimDomain is not null
+                                   ? $"dkim={Dkim(v.Dkim)} header.d={v.DkimDomain}"
+                                   : $"dkim={Dkim(v.Dkim)}";
 
             return $"Authentication-Results: {config.Hostname};\r\n" +
                    $"\tspf={Spf(v.Spf)} smtp.mailfrom={mailFrom};\r\n" +
-                   $"\tdkim={Dkim(v.Dkim)} header.d={senderDomain};\r\n" +
-                   $"\tdmarc={Dmarc(v.Dmarc)} header.from={senderDomain}{dmarcComment}\r\n";
+                   $"\t{dkimClause};\r\n" +
+                   $"\tdmarc={Dmarc(v.Dmarc)} header.from={fromDom}{dmarcComment}\r\n";
 
         }
 

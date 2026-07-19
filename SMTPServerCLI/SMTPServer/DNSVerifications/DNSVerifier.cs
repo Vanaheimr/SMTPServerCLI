@@ -57,7 +57,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 dkimTask.Result.Details,
                 dmarcTask.Result.Result,
                 dmarcTask.Result.Policy,
-                mxTask.Result
+                mxTask.Result,
+                dkimTask.Result.Domain
             );
 
         }
@@ -86,7 +87,22 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 Logger.Log(LogLevel.Debug, $"SPF record for {domain}: {spfRecord}");
 
-                var result = await EvaluateSpfAsync(spfRecord, clientIp, domain, mailFrom, new SpfLookupState(), ct);
+                // Macro context (RFC 7208 §7). An empty MAIL FROM uses "postmaster@<helo>".
+                string local, senderDom, sender;
+                if (string.IsNullOrEmpty(mailFrom))
+                {
+                    local = "postmaster"; senderDom = heloHostname; sender = $"postmaster@{heloHostname}";
+                }
+                else
+                {
+                    var at    = mailFrom.IndexOf('@');
+                    local     = at > 0 ? mailFrom[..at]       : "postmaster";
+                    senderDom = at > 0 ? mailFrom[(at + 1)..] : mailFrom;
+                    sender    = mailFrom;
+                }
+                var ctx = new SpfMacroContext(sender, local, senderDom, heloHostname);
+
+                var result = await EvaluateSpfAsync(spfRecord, clientIp, domain, ctx, new SpfLookupState(), ct);
                 return (result, spfRecord);
             }
             catch (Exception ex)
@@ -105,7 +121,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             string                spfRecord,
             System.Net.IPAddress  clientIp,
             string                domain,
-            string                mailFrom,
+            SpfMacroContext       ctx,
             SpfLookupState        state,
             CancellationToken     ct)
         {
@@ -160,8 +176,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (!CountLookup(state))
                         return SPFResult.PermError;
 
-                    var (target, ip4Cidr, ip6Cidr) = ParseTarget(StripName(mech, 1), domain);
-                    if (target is not null && await MatchAAsync(clientIp, target, ip4Cidr, ip6Cidr, ct))
+                    var (rawTarget, ip4Cidr, ip6Cidr) = ParseTarget(StripName(mech, 1), domain);
+                    var target = SpfMacros.Expand(rawTarget, domain, clientIp, ctx);
+                    if (await MatchAAsync(clientIp, target, ip4Cidr, ip6Cidr, ct))
                         return qualifier;
                 }
 
@@ -170,8 +187,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (!CountLookup(state))
                         return SPFResult.PermError;
 
-                    var (target, ip4Cidr, ip6Cidr) = ParseTarget(StripName(mech, 2), domain);
-                    if (target is not null && await MatchMxAsync(clientIp, target, ip4Cidr, ip6Cidr, ct))
+                    var (rawTarget, ip4Cidr, ip6Cidr) = ParseTarget(StripName(mech, 2), domain);
+                    var target = SpfMacros.Expand(rawTarget, domain, clientIp, ctx);
+                    if (await MatchMxAsync(clientIp, target, ip4Cidr, ip6Cidr, ct))
                         return qualifier;
                 }
 
@@ -180,15 +198,13 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (!CountLookup(state))
                         return SPFResult.PermError;
 
-                    var includeDomain = mech[8..];
-                    if (includeDomain.Contains("%{"))
-                        return SPFResult.PermError;   // macros unsupported
+                    var includeDomain = SpfMacros.Expand(mech[8..], domain, clientIp, ctx);
 
                     var includeRecord = await GetTxtRecordAsync(includeDomain, "v=spf1", ct);
                     if (includeRecord is null)
                         return SPFResult.PermError;    // include target without SPF record (RFC 7208 §5.2)
 
-                    var includeResult = await EvaluateSpfAsync(includeRecord, clientIp, includeDomain, mailFrom, state, ct);
+                    var includeResult = await EvaluateSpfAsync(includeRecord, clientIp, includeDomain, ctx, state, ct);
                     switch (includeResult)
                     {
                         case SPFResult.Pass:                          return qualifier;      // include matched
@@ -204,9 +220,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (!CountLookup(state))
                         return SPFResult.PermError;
 
-                    var existsDomain = mech.StartsWith("exists:") ? mech[7..] : domain;
-                    if (existsDomain.Contains("%{"))
-                        continue;   // macros unsupported -> treat as non-matching
+                    var existsDomain = SpfMacros.Expand(mech.StartsWith("exists:") ? mech[7..] : domain, domain, clientIp, ctx);
 
                     var ips = await ResolveIpsAsync(existsDomain, ct);
                     // 'exists' matches if the name has any A record (RFC 7208 §5.7)
@@ -238,14 +252,13 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 if (!CountLookup(state))
                     return SPFResult.PermError;
 
-                if (redirectDomain.Contains("%{"))
-                    return SPFResult.PermError;   // macros unsupported
+                var redirectTarget = SpfMacros.Expand(redirectDomain, domain, clientIp, ctx);
 
-                var redirectRecord = await GetTxtRecordAsync(redirectDomain, "v=spf1", ct);
+                var redirectRecord = await GetTxtRecordAsync(redirectTarget, "v=spf1", ct);
                 if (redirectRecord is null)
                     return SPFResult.PermError;    // RFC 7208 §6.1
 
-                return await EvaluateSpfAsync(redirectRecord, clientIp, redirectDomain, mailFrom, state, ct);
+                return await EvaluateSpfAsync(redirectRecord, clientIp, redirectTarget, ctx, state, ct);
             }
 
             return SPFResult.Neutral;
@@ -262,8 +275,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             return rest.StartsWith(':') ? rest[1..] : rest;
         }
 
-        // Parse "domain/ip4cidr//ip6cidr" (any part optional) into a target domain + CIDR lengths.
-        private static (string? Domain, int Ip4Cidr, int Ip6Cidr) ParseTarget(string spec, string defaultDomain)
+        // Parse "domain/ip4cidr//ip6cidr" (any part optional) into a target domain (still
+        // possibly containing macros) + CIDR lengths.
+        private static (string Domain, int Ip4Cidr, int Ip6Cidr) ParseTarget(string spec, string defaultDomain)
         {
             var ip4Cidr = 32;
             var ip6Cidr = 128;
@@ -278,8 +292,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 if (m.Groups[2].Success) ip6Cidr = int.Parse(m.Groups[2].Value);
             }
 
-            var target = string.IsNullOrEmpty(domainPart) ? defaultDomain : domainPart;
-            return (target.Contains("%{") ? null : target, ip4Cidr, ip6Cidr);
+            return (string.IsNullOrEmpty(domainPart) ? defaultDomain : domainPart, ip4Cidr, ip6Cidr);
         }
 
         private async Task<bool> MatchAAsync(System.Net.IPAddress clientIp, string domain, int ip4Cidr, int ip6Cidr, CancellationToken ct)
@@ -418,7 +431,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         #region DKIM Verification
 
-        private async Task<(DkimResult Result, string? Details)> VerifyDkimAsync(
+        private async Task<(DkimResult Result, string? Details, string? Domain)> VerifyDkimAsync(
             EMailMessage      message,
             CancellationToken ct)
         {
@@ -431,23 +444,26 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 var dkimFields          = fields.Where(f => f.Name.Equals("DKIM-Signature", StringComparison.OrdinalIgnoreCase)).ToList();
 
                 if (dkimFields.Count == 0)
-                    return (DkimResult.None, "No DKIM signature found");
+                    return (DkimResult.None, "No DKIM signature found", null);
 
                 (DkimResult Result, string? Details) last = (DkimResult.Fail, "All DKIM signatures failed verification");
+                string? lastDomain = null;
 
                 foreach (var dkimField in dkimFields)
                 {
+                    // d= of the signature being evaluated (for Authentication-Results header.d).
+                    lastDomain = ParseDkimHeader(dkimField.RawValue).GetValueOrDefault("d");
                     last = await VerifySingleDkimSignature(dkimField, fields, body, ct);
                     if (last.Result == DkimResult.Pass)
-                        return last;
+                        return (last.Result, last.Details, lastDomain);
                 }
 
-                return last;
+                return (last.Result, last.Details, lastDomain);
             }
             catch (Exception ex)
             {
                 Logger.Log(LogLevel.Warning, $"DKIM verification error: {ex.Message}");
-                return (DkimResult.TempError, ex.Message);
+                return (DkimResult.TempError, ex.Message, null);
             }
         }
 
