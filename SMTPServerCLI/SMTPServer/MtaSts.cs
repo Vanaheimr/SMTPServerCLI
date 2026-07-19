@@ -20,6 +20,8 @@
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
+using org.GraphDefined.Vanaheimr.Hermod.DNS;
+
 #endregion
 
 namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New;
@@ -90,12 +92,14 @@ public sealed partial record MtaStsPolicy
 public sealed partial class MtaStsResolver : IDisposable
 {
     private readonly HttpClient _httpClient;
+    private readonly DNSClient _dnsClient;
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<string, MtaStsPolicy> _cache = new();
     private readonly SemaphoreSlim _fetchLock = new(5); // Max 5 concurrent fetches
 
-    public MtaStsResolver(ILogger logger)
+    public MtaStsResolver(DNSClient dnsClient, ILogger logger)
     {
+        _dnsClient = dnsClient;
         _logger = logger;
         _httpClient = new HttpClient
         {
@@ -184,34 +188,21 @@ public sealed partial class MtaStsResolver : IDisposable
     {
         try
         {
-            var process = new System.Diagnostics.Process
-            {
-                StartInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = OperatingSystem.IsWindows() ? "nslookup" : "dig",
-                    Arguments = OperatingSystem.IsWindows()
-                        ? $"-type=TXT _mta-sts.{domain}"
-                        : $"+short TXT _mta-sts.{domain}",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                }
-            };
+            // DNSServiceName tolerates the leading-underscore label "_mta-sts".
+            var response = await _dnsClient.Query(
+                                     DNSServiceName.Parse($"_mta-sts.{domain}"),
+                                     [ DNSResourceRecordTypes.TXT ],
+                                     CancellationToken: ct
+                                 );
 
-            process.Start();
-            var output = await process.StandardOutput.ReadToEndAsync(ct);
-            await process.WaitForExitAsync(ct);
-
-            // Look for v=STSv1
-            if (output.Contains("v=STSv1", StringComparison.OrdinalIgnoreCase))
-            {
-                return output;
-            }
-
-            return null;
+            return response.Answers.
+                       OfType<TXT>().
+                       Select(txt => txt.Text).
+                       FirstOrDefault(text => text.Contains("v=STSv1", StringComparison.OrdinalIgnoreCase));
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.Log(LogLevel.Debug, $"MTA-STS TXT lookup failed for {domain}: {ex.Message}");
             return null;
         }
     }

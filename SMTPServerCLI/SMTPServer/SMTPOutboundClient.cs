@@ -22,7 +22,8 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Text.RegularExpressions;
+
+using org.GraphDefined.Vanaheimr.Hermod.DNS;
 
 #endregion
 
@@ -89,23 +90,26 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
     #region SMTP Outbound Client
 
-    public sealed partial class SMTPOutboundClient
+    public sealed class SMTPOutboundClient
     {
 
         private readonly SmtpOutboundConfig  _config;
         private readonly DkimSigner?         __dkimSigner;
         private readonly MtaStsResolver      _mtaStsResolver;
+        private readonly DNSClient           _dnsClient;
         private readonly ILogger             _logger;
 
         public SMTPOutboundClient(SmtpOutboundConfig  config,
                                   DkimSigner?         _dkimSigner,
+                                  DNSClient           dnsClient,
                                   ILogger             logger)
         {
 
             this._config          = config;
             this.__dkimSigner     = _dkimSigner;
+            this._dnsClient       = dnsClient;
             this._logger          = logger;
-            this._mtaStsResolver  = new MtaStsResolver(logger);
+            this._mtaStsResolver  = new MtaStsResolver(dnsClient, logger);
 
         }
 
@@ -253,8 +257,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             await client.ConnectAsync(mxHost, port, connectCts.Token);
 
             Stream stream = client.GetStream();
-            var reader = new StreamReader(stream, Encoding.ASCII);
-            var writer = new StreamWriter(stream, Encoding.ASCII) { AutoFlush = true };
+            // UTF-8 (ASCII-compatible) so SMTPUTF8/8BITMIME bodies relay intact; CRLF forced.
+            var reader = new StreamReader(stream, Encoding.UTF8);
+            var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true, NewLine = "\r\n" };
 
             try
             {
@@ -303,8 +308,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                         }, ct);
 
                         stream = sslStream;
-                        reader = new StreamReader(sslStream, Encoding.ASCII);
-                        writer = new StreamWriter(sslStream, Encoding.ASCII) { AutoFlush = true };
+                        reader = new StreamReader(sslStream, Encoding.UTF8);
+                        writer = new StreamWriter(sslStream, new UTF8Encoding(false)) { AutoFlush = true, NewLine = "\r\n" };
 
                         _logger.Log(LogLevel.Debug, $"TLS established with {mxHost}: {sslStream.SslProtocol}");
 
@@ -470,53 +475,16 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
             try
             {
-                // Use dig/nslookup for MX lookup
-                var process = new System.Diagnostics.Process
-                {
-                    StartInfo = new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = OperatingSystem.IsWindows() ? "nslookup" : "dig",
-                        Arguments = OperatingSystem.IsWindows()
-                            ? $"-type=MX {domain}"
-                            : $"+short MX {domain}",
-                        RedirectStandardOutput = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    }
-                };
+                var response = await _dnsClient.Query(
+                                         DomainName.Parse(domain),
+                                         [ DNSResourceRecordTypes.MX ],
+                                         CancellationToken: ct
+                                     );
 
-                process.Start();
-                var output = await process.StandardOutput.ReadToEndAsync(ct);
-                await process.WaitForExitAsync(ct);
-
-                var records = new List<MxRecord>();
-
-                if (OperatingSystem.IsWindows())
-                {
-                    // Parse nslookup output
-                    var matches = MxNslookupRegex().Matches(output);
-                    foreach (Match match in matches)
-                    {
-                        var priority = int.Parse(match.Groups[1].Value);
-                        var host = match.Groups[2].Value.TrimEnd('.');
-                        records.Add(new MxRecord(host, priority));
-                    }
-                }
-                else
-                {
-                    // Parse dig output: "10 mail.example.com."
-                    foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        var parts = line.Trim().Split(' ', 2);
-                        if (parts.Length == 2 && int.TryParse(parts[0], out var priority))
-                        {
-                            var host = parts[1].TrimEnd('.');
-                            records.Add(new MxRecord(host, priority));
-                        }
-                    }
-                }
-
-                return records;
+                return response.Answers.
+                           OfType<MX>().
+                           Select(mx => new MxRecord(mx.Exchange.FullName.TrimEnd('.'), mx.Preference)).
+                           ToList();
             }
             catch (Exception ex)
             {
@@ -524,9 +492,6 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 return [];
             }
         }
-
-        [GeneratedRegex(@"MX preference = (\d+), mail exchanger = (.+)")]
-        private static partial Regex MxNslookupRegex();
 
         #endregion
 

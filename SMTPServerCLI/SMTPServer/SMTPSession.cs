@@ -56,7 +56,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         // Use Latin1 (ISO-8859-1) encoding: 1:1 byte-to-char mapping for 0-255
         // ASCII only handles 0-127, which breaks BDAT with binary data!
         private StreamReader                   _reader         = new(client.GetStream(), Encoding.Latin1);
-        private StreamWriter                   _writer         = new(client.GetStream(), Encoding.Latin1) { AutoFlush = true };
+        // NewLine must be CRLF regardless of host OS (SMTP requires <CRLF>).
+        private StreamWriter                   _writer         = new(client.GetStream(), Encoding.Latin1) { AutoFlush = true, NewLine = "\r\n" };
         private SMTPSessionState               _state          = SMTPSessionState.Connected;
         private String?                        _mailFrom;
         private readonly List<String>          _rcptTo         = [];
@@ -65,6 +66,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private Boolean                        _tlsActive;
         private readonly System.Net.IPAddress  _clientIp       = ((IPEndPoint) client.Client.RemoteEndPoint!).Address;
         private String                         _heloHostname   = "";
+        private Boolean                        _extendedSmtp;   // true after EHLO (ESMTP), false after HELO
         private readonly SmtpAuthManager       _authManager    = new (userStore, logger);
         private Boolean                        _inAuthExchange;
         private X509Certificate2?              _clientCertificate;
@@ -227,6 +229,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private async Task HandleHeloAsync(String hostname)
         {
             _heloHostname = hostname;
+            _extendedSmtp = false;
             _state = SMTPSessionState.Greeted;
             await SendResponseAsync(250, $"Hello {hostname}, pleased to meet you");
         }
@@ -235,6 +238,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
 
             _heloHostname   = hostname;
+            _extendedSmtp   = true;
             _state          = SMTPSessionState.Greeted;
 
             var extensions  = new List<String> {
@@ -387,7 +391,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 _stream = sslStream;
                 _reader = new StreamReader(sslStream, Encoding.Latin1);
-                _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true };
+                _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true, NewLine = "\r\n" };
                 _tlsActive = true;
                 _state = SMTPSessionState.Connected;
 
@@ -591,16 +595,14 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 var line = await ReadLineAsync(ct);
 
-                Console.WriteLine($"LINE: '{line}'");
-
                 if (line is null)
                     break;
 
                 if (line == ".")
                     break;
 
-                // Dot-stuffing: remove leading dot if line starts with ".."
-                if (line.StartsWith(".."))
+                // Dot-stuffing: remove leading dot if line starts with ".." (RFC 5321 §4.5.2)
+                if (line.StartsWith('.'))
                     line = line[1..];
 
                 totalSize += line.Length + 2;
@@ -611,11 +613,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     return;
                 }
 
-                messageBuilder.AppendLine(line);
+                // Always terminate lines with CRLF, independent of the host OS.
+                messageBuilder.Append(line).Append("\r\n");
 
             }
 
-            var rawMessage = messageBuilder.ToString();
+            // The reader uses Latin1 (1 char == 1 wire byte). Reconstruct the original
+            // bytes and decode them as UTF-8 so SMTPUTF8/8BITMIME content is preserved
+            // (mirrors the BDAT path). ASCII content is unaffected.
+            var rawMessage = Encoding.UTF8.GetString(
+                                 Encoding.Latin1.GetBytes(messageBuilder.ToString())
+                             );
 
             await ProcessReceivedMessageAsync(rawMessage, ct);
 
@@ -721,12 +729,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         private async Task ProcessReceivedMessageAsync(String rawMessage, CancellationToken ct)
         {
 
-            var message   = EMailMessage.  Parse(rawMessage);
-            var message2  = EmailMessageV2.Parse(rawMessage);
+            var message   = EMailMessage.Parse(rawMessage);
 
             // Perform DNS verification (for inbound mail from other servers)
             var senderDomain = ExtractDomain(_mailFrom ?? "");
             DnsVerificationResult? verification = null;
+            var dmarcQuarantine = false;
 
             if (!String.IsNullOrEmpty(senderDomain) && !_authManager.IsAuthenticated)
             {
@@ -778,7 +786,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                         case "quarantine":
                             logger.Log(LogLevel.Warning, $"DMARC quarantine policy for {senderDomain} - marking as suspicious");
-                            message.Headers.Add(new KeyValuePair<String, String>("X-DMARC-Quarantine", "true"));
+                            dmarcQuarantine = true;
                             break;
 
                         case "none":
@@ -796,18 +804,28 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             connectionTracker?.RecordMessage(_clientIp);
             _counters.Messages++;
 
+            // Prepend trace information (RFC 5321 §4.4). Done after verification so SPF/DKIM/DMARC
+            // run on the original message; the stamped copy is what we store and relay.
+            var traceHeaders = await BuildReceivedHeaderAsync(ct);
+            if (dmarcQuarantine)
+                traceHeaders += "X-DMARC-Quarantine: true\r\n";
+
+            var stampedRaw     = traceHeaders + rawMessage;
+            var stampedMessage = EMailMessage.Parse(stampedRaw);
+            stampedMessage.Verification = verification;
+
             // Determine what to do with the message
             var hasLocalRecipients = _localRcptTo.Count > 0;
             var hasRemoteRecipients = _remoteRcptTo.Count > 0;
 
-            logger.Log(LogLevel.Info, 
+            logger.Log(LogLevel.Info,
                 $"Message from {_mailFrom}: {_localRcptTo.Count} local, {_remoteRcptTo.Count} remote recipients");
 
             // Store locally for local recipients
             string? filePath = null;
             if (hasLocalRecipients)
             {
-                filePath = await storage.StoreAsync(message, _mailFrom ?? "<>", _localRcptTo, ct);
+                filePath = await storage.StoreAsync(stampedMessage, _mailFrom ?? "<>", _localRcptTo, ct);
                 logger.Log(LogLevel.Info, $"Stored locally: {Path.GetFileName(filePath)}");
             }
 
@@ -840,7 +858,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                         Id = mailId,
                         EnvelopeFrom = _mailFrom ?? "",
                         EnvelopeTo = domainGroup.ToArray(),
-                        MessageContent = rawMessage,
+                        MessageContent = stampedRaw,
                         TargetDomain = domainGroup.Key,
                         QueuedAt = DateTime.UtcNow,
                         NextRetry = DateTime.UtcNow
@@ -864,7 +882,37 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         }
 
 
+        /// <summary>
+        /// Build a "Received:" trace header for this hop (RFC 5321 §4.4).
+        /// The header is returned terminated with CRLF, ready to be prepended to the message.
+        /// </summary>
+        private async Task<String> BuildReceivedHeaderAsync(CancellationToken ct)
+        {
 
+            // from-clause: HELO name + (reverse-DNS or "unknown") + [address-literal]
+            var reverseDns   = await dnsVerifier.ReverseLookupAsync(_clientIp, ct) ?? "unknown";
+            var addrLiteral  = _clientIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                                   ? $"[IPv6:{_clientIp}]"
+                                   : $"[{_clientIp}]";
+            var fromClause   = $"from {(_heloHostname.Length > 0 ? _heloHostname : "unknown")} ({reverseDns} {addrLiteral})";
+
+            // with-clause: RFC 3848 protocol name (HELO=SMTP, EHLO=ESMTP + S for TLS + A for AUTH)
+            var protocol     = !_extendedSmtp
+                                   ? "SMTP"
+                                   : "ESMTP" + (_tlsActive ? "S" : "") + (_authManager.IsAuthenticated ? "A" : "");
+
+            var id           = Guid.NewGuid().ToString("N")[..12].ToUpperInvariant();
+            var timestamp    = DateTimeOffset.UtcNow.ToString("ddd, dd MMM yyyy HH:mm:ss +0000",
+                                                              System.Globalization.CultureInfo.InvariantCulture);
+
+            // for-clause only for a single recipient (RFC 5321 §4.4: omit to avoid disclosing the list)
+            var forClause    = _rcptTo.Count == 1 ? $"\r\n\tfor <{_rcptTo[0]}>" : "";
+
+            return $"Received: {fromClause}\r\n" +
+                   $"\tby {config.Hostname} (AchimSMTP) with {protocol} id {id}{forClause};\r\n" +
+                   $"\t{timestamp}\r\n";
+
+        }
 
 
         private void LogVerificationResult(DnsVerificationResult v)

@@ -130,7 +130,7 @@ var outboundConfig = new SmtpOutboundConfig {
     SmartHostPassword  =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST_PASS")
 };
 
-var outboundClient = new SMTPOutboundClient(outboundConfig, dkimSigner, logger);
+var outboundClient = new SMTPOutboundClient(outboundConfig, dkimSigner, dnsClient, logger);
 
 // Setup bounce handler
 var bounceHandler = new BounceHandler(smtpServerConfig, mailQueue, logger);

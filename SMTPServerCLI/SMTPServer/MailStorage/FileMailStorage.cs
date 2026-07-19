@@ -39,30 +39,33 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             var fileName = $"{timestamp}_{SanitizeFileName(messageId)}.eml";
             var filePath = Path.Combine(basePath, fileName);
 
-            // Build metadata header
+            // Build metadata header (CRLF line endings, independent of host OS)
             var metadata = new StringBuilder();
-            metadata.AppendLine($"X-Envelope-From: {envelopeFrom}");
-            metadata.AppendLine($"X-Envelope-To: {string.Join(", ", envelopeTo)}");
-            metadata.AppendLine($"X-Received-At: {message.ReceivedAt:O}");
+            void AddHeader(string name, string value) => metadata.Append(name).Append(": ").Append(value).Append("\r\n");
+
+            AddHeader("X-Envelope-From", envelopeFrom);
+            AddHeader("X-Envelope-To",   string.Join(", ", envelopeTo));
+            AddHeader("X-Received-At",   $"{message.ReceivedAt:O}");
 
             if (message.Verification is not null)
             {
                 var v = message.Verification;
-                metadata.AppendLine($"X-SPF-Result: {v.Spf}");
-                metadata.AppendLine($"X-DKIM-Result: {v.Dkim}");
-                metadata.AppendLine($"X-DMARC-Result: {v.Dmarc}");
+                AddHeader("X-SPF-Result",   $"{v.Spf}");
+                AddHeader("X-DKIM-Result",  $"{v.Dkim}");
+                AddHeader("X-DMARC-Result", $"{v.Dmarc}");
                 if (v.SpfRecord is not null)
-                    metadata.AppendLine($"X-SPF-Record: {v.SpfRecord}");
+                    AddHeader("X-SPF-Record", v.SpfRecord);
                 if (v.DkimDetails is not null)
-                    metadata.AppendLine($"X-DKIM-Details: {v.DkimDetails}");
+                    AddHeader("X-DKIM-Details", v.DkimDetails);
                 if (v.DmarcPolicy is not null)
-                    metadata.AppendLine($"X-DMARC-Policy: {v.DmarcPolicy}");
+                    AddHeader("X-DMARC-Policy", v.DmarcPolicy);
                 if (v.MxRecords.Length > 0)
-                    metadata.AppendLine($"X-MX-Records: {string.Join(", ", v.MxRecords)}");
+                    AddHeader("X-MX-Records", string.Join(", ", v.MxRecords));
             }
 
             var fullMessage = metadata.ToString() + message.RawMessage;
-            await File.WriteAllTextAsync(filePath, fullMessage, ct);
+            // Write UTF-8 without BOM so the stored .eml starts with the first header byte.
+            await File.WriteAllTextAsync(filePath, fullMessage, new UTF8Encoding(false), ct);
 
             logger.Log(LogLevel.Info, $"Stored message: {filePath}");
             return filePath;

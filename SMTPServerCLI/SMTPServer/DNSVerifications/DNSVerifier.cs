@@ -64,12 +64,19 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         #region SPF Verification
 
+        // RFC 7208 §4.6.4: the total number of DNS-querying terms
+        // (a, mx, ptr, exists, include, redirect) MUST NOT exceed 10.
+        private const int MaxSpfDnsLookups = 10;
+
+        // Mutable lookup budget shared across the whole (recursive) evaluation.
+        private sealed class SpfLookupState { public int Lookups; }
+
         private async Task<(SPFResult Result, string? Record)> VerifySpfAsync(
-            string            domain,
-            System.Net.IPAddress         clientIp,
-            string            mailFrom,
-            string            heloHostname,
-            CancellationToken ct)
+            string               domain,
+            System.Net.IPAddress clientIp,
+            string               mailFrom,
+            string               heloHostname,
+            CancellationToken    ct)
         {
             try
             {
@@ -79,7 +86,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
                 Logger.Log(LogLevel.Debug, $"SPF record for {domain}: {spfRecord}");
 
-                var result = EvaluateSpf(spfRecord, clientIp, domain, mailFrom);
+                var result = await EvaluateSpfAsync(spfRecord, clientIp, domain, mailFrom, new SpfLookupState(), ct);
                 return (result, spfRecord);
             }
             catch (Exception ex)
@@ -89,64 +96,284 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             }
         }
 
-        private SPFResult EvaluateSpf(string spfRecord, System.Net.IPAddress clientIp, string domain, string mailFrom)
+        /// <summary>
+        /// Evaluate an SPF record against the client IP (RFC 7208).
+        /// Handles the a/mx/ip4/ip6/include/exists/all mechanisms, the redirect modifier,
+        /// dual-CIDR lengths, and the shared 10-DNS-lookup limit across recursion.
+        /// </summary>
+        private async Task<SPFResult> EvaluateSpfAsync(
+            string                spfRecord,
+            System.Net.IPAddress  clientIp,
+            string                domain,
+            string                mailFrom,
+            SpfLookupState        state,
+            CancellationToken     ct)
         {
-            var mechanisms = spfRecord.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        
-            foreach (var mechanism in mechanisms.Skip(1)) // Skip "v=spf1"
+
+            var terms = spfRecord.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            string? redirectDomain = null;
+
+            foreach (var term in terms)
             {
-                var qualifier = mechanism[0] switch
+
+                if (term.Equals("v=spf1", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Modifiers are "name=value" (redirect=, exp=, unknown). Mechanisms never contain '='.
+                if (term.Contains('='))
+                {
+                    var eq = term.IndexOf('=');
+                    if (term[..eq].Equals("redirect", StringComparison.OrdinalIgnoreCase))
+                        redirectDomain = term[(eq + 1)..];
+                    // exp= and unknown modifiers are ignored (RFC 7208 §6)
+                    continue;
+                }
+
+                var qualifier = term[0] switch
                 {
                     '+' => SPFResult.Pass,
                     '-' => SPFResult.Fail,
                     '~' => SPFResult.SoftFail,
                     '?' => SPFResult.Neutral,
-                    _   => SPFResult.Pass // Default qualifier is Pass
+                    _   => SPFResult.Pass   // default qualifier
                 };
 
-                var mech = mechanism.TrimStart('+', '-', '~', '?').ToLowerInvariant();
+                var mech = (term[0] is '+' or '-' or '~' or '?' ? term[1..] : term).ToLowerInvariant();
 
                 if (mech == "all")
                     return qualifier;
 
-                if (mech.StartsWith("ip4:") && clientIp.AddressFamily == AddressFamily.InterNetwork)
+                else if (mech.StartsWith("ip4:"))
                 {
-                    var cidr = mech[4..];
-                    if (IpMatchesCidr(clientIp, cidr))
+                    if (clientIp.AddressFamily == AddressFamily.InterNetwork && IpMatchesCidr(clientIp, mech[4..]))
                         return qualifier;
                 }
-                else if (mech.StartsWith("ip6:") && clientIp.AddressFamily == AddressFamily.InterNetworkV6)
+
+                else if (mech.StartsWith("ip6:"))
                 {
-                    var cidr = mech[4..];
-                    if (IpMatchesCidr(clientIp, cidr))
+                    if (clientIp.AddressFamily == AddressFamily.InterNetworkV6 && IpMatchesCidr(clientIp, mech[4..]))
                         return qualifier;
                 }
-                else if (mech.StartsWith("a:") || mech == "a")
+
+                else if (mech == "a" || mech.StartsWith("a:") || mech.StartsWith("a/"))
                 {
-                    var targetDomain = mech == "a" ? domain : mech[2..];
-                    if (CheckARecord(clientIp, targetDomain).Result)
+                    if (!CountLookup(state))
+                        return SPFResult.PermError;
+
+                    var (target, ip4Cidr, ip6Cidr) = ParseTarget(StripName(mech, 1), domain);
+                    if (target is not null && await MatchAAsync(clientIp, target, ip4Cidr, ip6Cidr, ct))
                         return qualifier;
                 }
-                else if (mech.StartsWith("mx:") || mech == "mx")
+
+                else if (mech == "mx" || mech.StartsWith("mx:") || mech.StartsWith("mx/"))
                 {
-                    var targetDomain = mech == "mx" ? domain : mech[3..];
-                    if (CheckMxRecord(clientIp, targetDomain).Result)
+                    if (!CountLookup(state))
+                        return SPFResult.PermError;
+
+                    var (target, ip4Cidr, ip6Cidr) = ParseTarget(StripName(mech, 2), domain);
+                    if (target is not null && await MatchMxAsync(clientIp, target, ip4Cidr, ip6Cidr, ct))
                         return qualifier;
                 }
+
                 else if (mech.StartsWith("include:"))
                 {
+                    if (!CountLookup(state))
+                        return SPFResult.PermError;
+
                     var includeDomain = mech[8..];
-                    var includeRecord = GetTxtRecordAsync(includeDomain, "v=spf1", CancellationToken.None).Result;
-                    if (includeRecord is not null)
+                    if (includeDomain.Contains("%{"))
+                        return SPFResult.PermError;   // macros unsupported
+
+                    var includeRecord = await GetTxtRecordAsync(includeDomain, "v=spf1", ct);
+                    if (includeRecord is null)
+                        return SPFResult.PermError;    // include target without SPF record (RFC 7208 §5.2)
+
+                    var includeResult = await EvaluateSpfAsync(includeRecord, clientIp, includeDomain, mailFrom, state, ct);
+                    switch (includeResult)
                     {
-                        var includeResult = EvaluateSpf(includeRecord, clientIp, includeDomain, mailFrom);
-                        if (includeResult == SPFResult.Pass)
-                            return qualifier;
+                        case SPFResult.Pass:                          return qualifier;      // include matched
+                        case SPFResult.Fail or SPFResult.SoftFail
+                                             or SPFResult.Neutral:    break;                 // no match, keep going
+                        case SPFResult.TempError:                     return SPFResult.TempError;
+                        default:                                      return SPFResult.PermError;  // None/PermError
                     }
                 }
+
+                else if (mech == "exists" || mech.StartsWith("exists:"))
+                {
+                    if (!CountLookup(state))
+                        return SPFResult.PermError;
+
+                    var existsDomain = mech.StartsWith("exists:") ? mech[7..] : domain;
+                    if (existsDomain.Contains("%{"))
+                        continue;   // macros unsupported -> treat as non-matching
+
+                    var ips = await ResolveIpsAsync(existsDomain, ct);
+                    // 'exists' matches if the name has any A record (RFC 7208 §5.7)
+                    if (ips.Any(ip => ip.AddressFamily == AddressFamily.InterNetwork))
+                        return qualifier;
+                }
+
+                else if (mech == "ptr" || mech.StartsWith("ptr:"))
+                {
+                    if (!CountLookup(state))
+                        return SPFResult.PermError;
+
+                    // 'ptr' is deprecated (RFC 7208 §5.5) and intentionally not evaluated; counts against the limit.
+                    Logger.Log(LogLevel.Debug, "SPF 'ptr' mechanism is deprecated and skipped");
+                }
+
+                else
+                {
+                    // Unknown mechanism => PermError (RFC 7208 §4.6.1)
+                    Logger.Log(LogLevel.Debug, $"SPF unknown mechanism '{mech}' => PermError");
+                    return SPFResult.PermError;
+                }
+
+            }
+
+            // No mechanism matched: apply redirect (if no 'all' was present), else default Neutral.
+            if (redirectDomain is not null)
+            {
+                if (!CountLookup(state))
+                    return SPFResult.PermError;
+
+                if (redirectDomain.Contains("%{"))
+                    return SPFResult.PermError;   // macros unsupported
+
+                var redirectRecord = await GetTxtRecordAsync(redirectDomain, "v=spf1", ct);
+                if (redirectRecord is null)
+                    return SPFResult.PermError;    // RFC 7208 §6.1
+
+                return await EvaluateSpfAsync(redirectRecord, clientIp, redirectDomain, mailFrom, state, ct);
             }
 
             return SPFResult.Neutral;
+
+        }
+
+        private static bool CountLookup(SpfLookupState state)
+            => ++state.Lookups <= MaxSpfDnsLookups;
+
+        // Strip the leading mechanism keyword (and an optional ':') from a mechanism term.
+        private static string StripName(string mech, int keywordLength)
+        {
+            var rest = mech[keywordLength..];
+            return rest.StartsWith(':') ? rest[1..] : rest;
+        }
+
+        // Parse "domain/ip4cidr//ip6cidr" (any part optional) into a target domain + CIDR lengths.
+        private static (string? Domain, int Ip4Cidr, int Ip6Cidr) ParseTarget(string spec, string defaultDomain)
+        {
+            var ip4Cidr = 32;
+            var ip6Cidr = 128;
+
+            var domainPart = spec;
+            var slash      = spec.IndexOf('/');
+            if (slash >= 0)
+            {
+                domainPart = spec[..slash];
+                var m = Regex.Match(spec[slash..], @"^(?:/(\d+))?(?://(\d+))?$");
+                if (m.Groups[1].Success) ip4Cidr = int.Parse(m.Groups[1].Value);
+                if (m.Groups[2].Success) ip6Cidr = int.Parse(m.Groups[2].Value);
+            }
+
+            var target = string.IsNullOrEmpty(domainPart) ? defaultDomain : domainPart;
+            return (target.Contains("%{") ? null : target, ip4Cidr, ip6Cidr);
+        }
+
+        private async Task<bool> MatchAAsync(System.Net.IPAddress clientIp, string domain, int ip4Cidr, int ip6Cidr, CancellationToken ct)
+        {
+            foreach (var ip in await ResolveIpsAsync(domain, ct))
+            {
+                if (ip.AddressFamily != clientIp.AddressFamily)
+                    continue;
+
+                var cidr = clientIp.AddressFamily == AddressFamily.InterNetwork ? ip4Cidr : ip6Cidr;
+                if (IpMatchesCidr(clientIp, $"{ip}/{cidr}"))
+                    return true;
+            }
+            return false;
+        }
+
+        private async Task<bool> MatchMxAsync(System.Net.IPAddress clientIp, string domain, int ip4Cidr, int ip6Cidr, CancellationToken ct)
+        {
+            var mxHosts = await GetMxRecordsAsync(domain, ct);
+
+            // RFC 7208 §4.6.4: at most 10 MX names are processed.
+            foreach (var mx in mxHosts.Take(10))
+            {
+                if (await MatchAAsync(clientIp, mx, ip4Cidr, ip6Cidr, ct))
+                    return true;
+            }
+            return false;
+        }
+
+        private async Task<System.Net.IPAddress[]> ResolveIpsAsync(string domain, CancellationToken ct)
+        {
+            try
+            {
+                var response = await DNSClient.Query(
+                                         DNSServiceName.Parse(domain),
+                                         [ DNSResourceRecordTypes.A, DNSResourceRecordTypes.AAAA ],
+                                         CancellationToken: ct
+                                     );
+
+                var addresses = new List<System.Net.IPAddress>();
+                foreach (var a in response.Answers.OfType<A>())
+                    addresses.Add(new System.Net.IPAddress(a.IPv4Address.GetBytes()));
+                foreach (var aaaa in response.Answers.OfType<AAAA>())
+                    addresses.Add(new System.Net.IPAddress(aaaa.IPv6Address.GetBytes()));
+
+                return [.. addresses];
+            }
+            catch (Exception ex)
+            {
+                Logger.Log(LogLevel.Debug, $"A/AAAA lookup failed for {domain}: {ex.Message}");
+                return [];
+            }
+        }
+
+        /// <summary>
+        /// Reverse (PTR) lookup for an IP address via the Hermod DNS client.
+        /// Returns the first PTR target hostname (without trailing dot), or null.
+        /// </summary>
+        public async Task<String?> ReverseLookupAsync(System.Net.IPAddress ip, CancellationToken ct = default)
+        {
+            try
+            {
+                var response = await DNSClient.Query(
+                                         DNSServiceName.Parse(BuildReverseName(ip)),
+                                         [ DNSResourceRecordTypes.PTR ],
+                                         CancellationToken: ct
+                                     );
+
+                var ptr = response.Answers.OfType<PTR>().FirstOrDefault();
+                return ptr?.Target.FullName.TrimEnd('.');
+            }
+            catch (Exception ex)
+            {
+                Logger.Log(LogLevel.Debug, $"PTR lookup failed for {ip}: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Build the reverse-DNS query name: "4.3.2.1.in-addr.arpa" / nibble-reversed "...ip6.arpa".
+        private static String BuildReverseName(System.Net.IPAddress ip)
+        {
+            var bytes = ip.GetAddressBytes();
+
+            if (ip.AddressFamily == AddressFamily.InterNetwork)
+                return String.Join('.', bytes.Reverse()) + ".in-addr.arpa";
+
+            var sb = new StringBuilder();
+            for (var i = bytes.Length - 1; i >= 0; i--)
+            {
+                sb.Append((bytes[i] & 0x0F).ToString("x")).Append('.');
+                sb.Append((bytes[i] >> 4)  .ToString("x")).Append('.');
+            }
+            sb.Append("ip6.arpa");
+            return sb.ToString();
         }
 
         private static bool IpMatchesCidr(System.Net.IPAddress ip, string cidr)
@@ -180,38 +407,6 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 }
 
                 return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private async Task<bool> CheckARecord(System.Net.IPAddress clientIp, string domain)
-        {
-            try
-            {
-                var addresses = await Dns.GetHostAddressesAsync(domain);
-                return addresses.Contains(clientIp);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private async Task<bool> CheckMxRecord(System.Net.IPAddress clientIp, string domain)
-        {
-            try
-            {
-                var mxRecords = await GetMxRecordsAsync(domain, CancellationToken.None);
-                foreach (var mx in mxRecords)
-                {
-                    var addresses = await Dns.GetHostAddressesAsync(mx);
-                    if (addresses.Contains(clientIp))
-                        return true;
-                }
-                return false;
             }
             catch
             {
@@ -499,39 +694,25 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
             try
             {
-                // Use system DNS resolver through nslookup simulation
-                // In production, use a proper DNS library like DnsClient
-                var process = new System.Diagnostics.Process
-                {
-                    StartInfo = new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = OperatingSystem.IsWindows() ? "nslookup" : "dig",
-                        Arguments = OperatingSystem.IsWindows() 
-                            ? $"-type=TXT {domain}"
-                            : $"+short TXT {domain}",
-                        RedirectStandardOutput = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    }
-                };
+                // DNSServiceName (not DomainName) so underscore labels like
+                // _dmarc.* and *._domainkey.* validate (DMARC/DKIM lookups).
+                var response = await DNSClient.Query(
+                                         DNSServiceName.Parse(domain),
+                                         [ DNSResourceRecordTypes.TXT ],
+                                         CancellationToken: ct
+                                     );
 
-                process.Start();
-                var output = await process.StandardOutput.ReadToEndAsync(ct);
-                await process.WaitForExitAsync(ct);
-
-                // Parse TXT records
-                var matches = TxtRecordRegex().Matches(output);
-                foreach (Match match in matches)
+                foreach (var txt in response.Answers.OfType<TXT>())
                 {
-                    var record = match.Groups[1].Value.Replace("\" \"", "");
-                    if (record.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                        return record;
+                    if (txt.Text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        return txt.Text;
                 }
 
                 return null;
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.Log(LogLevel.Debug, $"TXT lookup failed for {domain}: {ex.Message}");
                 return null;
             }
         }
@@ -540,38 +721,25 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         {
             try
             {
-                var process = new System.Diagnostics.Process
-                {
-                    StartInfo = new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = OperatingSystem.IsWindows() ? "nslookup" : "dig",
-                        Arguments = OperatingSystem.IsWindows()
-                            ? $"-type=MX {domain}"
-                            : $"+short MX {domain}",
-                        RedirectStandardOutput = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    }
-                };
+                var response = await DNSClient.Query(
+                                         DomainName.Parse(domain),
+                                         [ DNSResourceRecordTypes.MX ],
+                                         CancellationToken: ct
+                                     );
 
-                process.Start();
-                var output = await process.StandardOutput.ReadToEndAsync(ct);
-                await process.WaitForExitAsync(ct);
-
-                var matches = MxRecordRegex().Matches(output);
-                return matches.Select(m => m.Groups[1].Value.TrimEnd('.')).ToArray();
+                // Ordered by preference (lowest = highest priority), returned as bare hostnames.
+                return response.Answers.
+                           OfType<MX>().
+                           OrderBy(mx => mx.Preference).
+                           Select(mx => mx.Exchange.FullName.TrimEnd('.')).
+                           ToArray();
             }
-            catch
+            catch (Exception ex)
             {
+                Logger.Log(LogLevel.Debug, $"MX lookup failed for {domain}: {ex.Message}");
                 return [];
             }
         }
-
-        [GeneratedRegex(@"""([^""]+)""")]
-        private static partial Regex TxtRecordRegex();
-
-        [GeneratedRegex(@"(?:^\d+\s+)?(\S+\.?)$", RegexOptions.Multiline)]
-        private static partial Regex MxRecordRegex();
 
         #endregion
 

@@ -69,9 +69,7 @@ static async Task TestWithoutTlsAsync(String host, UInt16 port)
 
     var message       = emailBuilder.AsImmutable.ToString();
 
-    await writer.WriteAsync(message.ReplaceLineEndings("\r\n"));
-    await writer.WriteLineAsync("\r\n.");
-    await ReadResponseAsync(reader);
+    await SendDataAsync(writer, reader, message);
     await SendCommandAsync(writer, reader, "QUIT");
 
     Console.WriteLine("✓ Plain SMTP test completed");
@@ -152,9 +150,7 @@ static async Task TestWithStartTlsAndAuthPlain_DATA(String host, UInt16 port)
 
         var message       = emailBuilder.AsImmutable.ToString();
 
-        await writer.WriteAsync(message.ReplaceLineEndings("\r\n"));
-        await writer.WriteLineAsync("\r\n.");
-        await ReadResponseAsync(reader);
+        await SendDataAsync(writer, reader, message);
         await SendCommandAsync(writer, reader, "QUIT");
 
         Console.WriteLine("✓ AUTH PLAIN test completed");
@@ -469,6 +465,27 @@ static async Task SendCommandAsync(StreamWriter writer, StreamReader reader, Str
 {
     Console.WriteLine($"C: {command}");
     await writer.WriteLineAsync(command);
+    await ReadResponseAsync(reader);
+}
+
+// Transmit a message body over DATA with correct dot-stuffing (RFC 5321 §4.5.2):
+// any line starting with '.' gets an extra leading '.', then the final <CRLF>.<CRLF>.
+static async Task SendDataAsync(StreamWriter writer, StreamReader reader, String message)
+{
+    var normalized = message.ReplaceLineEndings("\r\n");
+    using var lines = new StringReader(normalized);
+
+    String? line;
+    while ((line = await lines.ReadLineAsync()) is not null)
+    {
+        if (line.StartsWith('.'))
+            await writer.WriteAsync('.');
+        await writer.WriteAsync(line);
+        await writer.WriteAsync("\r\n");
+    }
+
+    await writer.WriteAsync(".\r\n");
+    await writer.FlushAsync();
     await ReadResponseAsync(reader);
 }
 
