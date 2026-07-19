@@ -435,11 +435,16 @@ await sender.SendAsync(mail,
     Dsn: new DsnParameters(DsnNotify.Success | DsnNotify.Failure, DsnRet.Full, EnvId: "order-4711"));
 ```
 
-`DsnNotify` is a `[Flags]` enum (`Success`/`Failure`/`Delay`, or `Never`). On the
-receiving side the queue emits the matching report and mails it back to the sender
-with a null return-path (loop-safe): a **failure** bounce (default), a **delay**
-warning, or — when `NOTIFY=SUCCESS` was requested — a positive
-`multipart/report; report-type=delivery-status` **delivered** DSN.
+`DsnNotify` is a `[Flags]` enum (`Success`/`Failure`/`Delay`, or `Never`). The
+receiving/relaying side emits the matching `multipart/report; report-type=delivery-status`
+report and mails it back with a null return-path (loop-safe): a **failure** bounce
+(default) or a **delay** warning, and — when `NOTIFY=SUCCESS` was requested — a
+positive DSN with the RFC 3461-correct action:
+
+- **`delivered`** when the message reaches a **local mailbox** (final delivery).
+- **`relayed`** when it is handed to the **next hop** — but only if that hop does
+  *not* advertise DSN; if it does, it owns the delivered notification and we don't
+  duplicate it.
 
 **Read receipts (MDN, RFC 8098).** A sender requests one via the builder's
 `DispositionNotificationTo`; a receiving client detects and generates one from the
