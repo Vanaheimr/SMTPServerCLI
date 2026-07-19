@@ -11,8 +11,10 @@ live in the child namespace `org.GraphDefined.Vanaheimr.Hermod.SMTP.Server`;
 everything reusable (message model, DKIM/SPF/DMARC/ARC/DANE/TLS-RPT engines, the
 outbound client + queue) stays in `…SMTP`. It implements the modern SMTP
 stack — ESMTP, STARTTLS, implicit TLS, SASL AUTH, SPF, DKIM, DMARC, ARC,
-MTA-STS, DANE, TLS-RPT, DSN — with a strong focus on RFC-correct behaviour,
-cross-validated against independent reference implementations and live domains.
+MTA-STS, DANE, TLS-RPT, DSN, MT-PRIORITY — with a strong focus on RFC-correct
+behaviour, cross-validated against independent reference implementations and live
+domains. On the message side it composes and parses OpenPGP/MIME (sign/encrypt +
+inbound verify/decrypt), read receipts (MDN), and message importance/priority.
 
 > ### ⚠️ Status: RFC-conformant reference implementation — not a hardened production MX
 >
@@ -62,7 +64,9 @@ the table are relative to that folder); only the CLI entry point
 | `MailSender` | `MailSender.cs` | MTA outbound entry point for typed `EMail`/`EMailEnvelop` (Hermod.Mail builders): `SendAsync` = queued "letter" delivery; `SendDirectAsync` = synchronous direct-to-MX with a per-domain `SendResult` |
 | `IMailSubmitter` / `MailSubmitter` / `NullMailSubmitter` | `MailSubmitter.cs` | Submission (RFC 6409) entry point: hand a typed message to a configured relay/submission server (STARTTLS + SASL AUTH), synchronous, returns a status — the interface an app injects for transactional mail |
 | `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay (raw-string `SendAsync` is `internal`) |
-| `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue, retries, DSN bounces |
+| `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue (priority-ordered), retries, DSN failure/delay/success reports |
+| `EMail` + builders + `OpenPGP` | `EMail/`, `BouncyCastle/OpenPGP*.cs` | Typed message model: HTML/text/multipart/attachments, OpenPGP sign/encrypt + inbound verify/decrypt (RFC 3156), read receipts (RFC 8098), importance (RFC 2156) |
+| `Dsn` / `MtPriority` | `Dsn.cs`, `MtPriority.cs` | DSN request + report generation (RFC 3461/3464) and MT-PRIORITY (RFC 6710) parse/format |
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
 | `DaneResolver` + `DaneAuthenticator` | `Dane.cs` | RFC 7672 DNSSEC-validated TLSA lookup + certificate matching |
@@ -92,7 +96,8 @@ subprocesses or `System.Net.Dns` calls in the active code.
 | `SMTPUTF8` | [RFC 6531](https://www.rfc-editor.org/rfc/rfc6531) | Internationalized email; UTF-8 preserved end-to-end |
 | `ENHANCEDSTATUSCODES` | [RFC 2034](https://www.rfc-editor.org/rfc/rfc2034) | `x.y.z` codes on responses |
 | `CHUNKING` (`BDAT`) | [RFC 3030](https://www.rfc-editor.org/rfc/rfc3030) | Binary-safe, dot-stuffing-free transfer |
-| `DSN` | [RFC 3461](https://www.rfc-editor.org/rfc/rfc3461) | `ENVID`, `RET`, `NOTIFY`, `ORCPT` parsed |
+| `DSN` | [RFC 3461](https://www.rfc-editor.org/rfc/rfc3461) | `ENVID`, `RET`, `NOTIFY`, `ORCPT` parsed; failure/delay/success reports generated |
+| `MT-PRIORITY` | [RFC 6710](https://www.rfc-editor.org/rfc/rfc6710) | `MT-PRIORITY=` parsed from `MAIL FROM`; orders the outbound queue |
 | `STARTTLS` | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207) | Advertised until TLS is active |
 | `REQUIRETLS` | [RFC 8689](https://www.rfc-editor.org/rfc/rfc8689) | Advertised only after STARTTLS |
 | `AUTH` | [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954) | Mechanisms depend on TLS state |
@@ -541,6 +546,7 @@ TLS-RPT).
 | **DMARC reporting** | Aggregator grouping/counts + JSON persistence across restart; the full send pipeline (MIME + gzip + external-dest consent) through a fake queue; the gzipped attachment is gunzipped and the RFC 7489 XML is parsed and asserted (policy, per-row counts, alignment, `header_from`, `auth_results`); ARF forensic report structure + hourly rate limit. |
 | **ARC** | Cross-validated **both directions** with Python **`dkimpy`**: dkimpy verifies our 1-hop and 2-hop sealed chains (`cv=pass`), and our validator accepts a dkimpy-sealed message. Plus self-tests: seal↔validate round-trip, 2-hop chain, body/seal tamper detection, and cv-chain enforcement. |
 | **E-mail builders & OpenPGP** | 33 tests in `HermodTests/SMTP/EMailBuilderTests.cs` (RSA key rings generated in-test). Build side: HTML/Text × attachment × PGP matrix, each built, serialized and **re-parsed** (round-trip) with signatures cryptographically verified and the multipart tree reconstructed; all five `EMailSecurity` modes (incl. `autosign`/`auto` graceful degradation); encryption round-trips that actually **decrypt** back to the plaintext; multi-recipient encryption addressing (and decrypting for) every `To`. Inbound side: `IsPgpSigned`/`IsPgpEncrypted`, `VerifyPgpSignature` (Valid / tampered→Invalid / wrong-key→NoMatchingKey / unsigned→NoSignature / a hand-assembled *foreign* serialization verified via raw bytes), `DecryptPgp`, and `DecryptAndVerifyPgp`. This work uncovered and fixed several real bugs: three MIME re-parse bugs, `EMailSecurity.encrypt` silently sending plaintext, and encrypt addressing only the first `To`. |
+| **Receipts, DSN & priority** | `MdnTests` (6): read-receipt request detection and RFC 8098 `multipart/report` generation (fields, re-parse, disposition types). `DsnTests` (9): the MAIL FROM / RCPT TO `NOTIFY`/`RET`/`ENVID`/`ORCPT` construction (only when the remote supports DSN), the sender facade threading the request onto the queued mail, and a success DSN queued back to the sender only when `NOTIFY=SUCCESS`. `PriorityTests` (13): `Importance` header emission/parse/precedence and MT-PRIORITY helpers plus an end-to-end `FileMailQueue` ordering check (enqueued `0,5,-3,9,2` → drained `9,5,2,0,-3`). |
 | **DANE / DNSSEC** | Live TLSA lookups + full **DNSSEC chain validation** against real signed zones (`posteo.de`, `mailbox.org` → `Secure`/usable; `gmail.com` → no DANE); deterministic certificate-matcher tests (`3 1 1`/`3 1 2`/`3 0 0`/`3 0 1`, tamper → no match, PKIX-usage ignored, DANE-TA). This work exposed and fixed three DNSSEC-stack bugs in Hermod (missing EDNS DO bit, root-name wire-encoding FORMERR, unsupported RSA-SHA1). |
 | **TLS-RPT (outbound)** | Record parsing, aggregation (successes + typed failures, MX aggregation), and RFC 8460 §4 JSON re-parsed and field-checked; live `_smtp._tls` lookup (`google.com`/`gmail.com` → real `rua`). |
 | **TLS-RPT (inbound)** | Closed-loop ingestion: a gzipped `multipart/report` **and** an uncompressed `application/tlsrpt+json` both parse to the expected session/failure counts and persist; an ordinary message is not misdetected; `ParseJson` tolerates missing fields and rejects garbage. |
