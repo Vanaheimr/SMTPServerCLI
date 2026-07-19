@@ -349,6 +349,67 @@ raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and hand-crafting a
 `QueuedMail`) are `internal`, so a caller cannot inject an unchecked message
 string — everything goes through the typed facades above.
 
+### Secure mail (OpenPGP / PGP-MIME, RFC 3156)
+
+**Composing.** Set `SecurityLevel` on any builder; the key material comes from the
+`EMailAddress` objects (`From.SecretKeyRing` + `Passphrase` to sign, each
+recipient's `PublicKeyRing` to encrypt):
+
+| `EMailSecurity` | Result | Fails if… |
+|-----------------|--------|-----------|
+| `none` | plaintext | — |
+| `autosign` | sign *if a key is available*, else plaintext | never |
+| `sign` | `multipart/signed` | no signing key / passphrase |
+| `auto` | sign, and encrypt too *if every recipient has a public key*, else degrade | never |
+| `encrypt` | `multipart/encrypted` (**always signed as well**) | no signing key, or any recipient lacks a public key |
+
+There is deliberately **no encrypt-without-sign** mode — an encrypted-but-unsigned
+mail has confidentiality but no authenticity (unverifiable sender). Encryption
+addresses **all** `To` + `Cc` recipients (one session-key packet each), not just
+the first.
+
+**Receiving.** A parsed inbound `EMail` exposes the OpenPGP structure and the
+verify/decrypt operations:
+
+| Member | Returns | Purpose |
+|--------|---------|---------|
+| `IsPgpSigned` / `IsPgpEncrypted` | `bool` | cheap structural check (Content-Type only) |
+| `VerifyPgpSignature(senderKey)` | `PgpSignatureVerification` | verify a `multipart/signed` mail |
+| `DecryptPgp(recipientKey, passphrase)` | `EMailBodypart` | decrypt a `multipart/encrypted` mail |
+| `DecryptAndVerifyPgp(recipientKey, passphrase, senderKey)` | `PgpDecryptionResult` | decrypt **and** verify the embedded signature in one pass |
+
+`PgpSignatureVerification.Status` is `NoSignature`, `NoMatchingKey` (signature
+present but no public key supplied for the signer), `Valid`, or `Invalid`; it also
+carries `SignerKeyId`, `HashAlgorithm`, `CreationTime`, and `IsValid`.
+`PgpDecryptionResult` is `{ EMailBodypart Body, PgpSignatureVerification Signature }`
+— decryption depends only on the recipient key, so a wrong/absent sender key still
+returns the plaintext but reports `NoMatchingKey`.
+
+```csharp
+var mail = EMail.Parse(rawLines);          // an inbound message
+
+if (mail.IsPgpSigned)
+{
+    var v = mail.VerifyPgpSignature(senderPublicKey);
+    // v.IsValid, v.Status, v.SignerKeyIdHex, v.HashAlgorithm, v.CreationTime
+}
+
+if (mail.IsPgpEncrypted)
+{
+    // "show it encrypted, then supply the key" — and, since our senders always
+    // sign when they encrypt, verify authenticity in the same step:
+    var r = mail.DecryptAndVerifyPgp(mySecretKey, passphrase, senderPublicKey);
+    EMailBodypart plaintext = r.Body;       // the decrypted inner MIME part
+    bool          authentic = r.IsSignatureValid;
+    // (use DecryptPgp(...) instead if you only need the content, not the signature)
+}
+```
+
+Signature verification runs against the **raw on-the-wire bytes** of the signed
+MIME part (preserved as `EMailBodypart.RawContent` at parse time), per RFC 1847 —
+not a re-serialization of the object model — so it is robust to header ordering,
+whitespace, and boundary differences in third-party mail.
+
 ---
 
 ## Standards conformance
@@ -372,6 +433,7 @@ string — everything goes through the typed facades above.
 | 8460 | TLS-RPT (SMTP TLS Reporting) | ✅ outbound reports + inbound ingestion (opt-in) |
 | 7208 | SPF (incl. macros §7) | ✅ complete |
 | 6376 | DKIM | ✅ complete, cross-validated |
+| 3156 / 1847 | OpenPGP/MIME (multipart/signed & /encrypted) | ✅ compose + inbound verify/decrypt; verifies raw on-wire bytes |
 | 8601 | Authentication-Results | ✅ |
 | 7435 | Opportunistic security (TLS) | ✅ outbound cert policy |
 | 7489 | DMARC | ✅ alignment + PSL + `rua`/`ruf` report generation |
@@ -405,7 +467,7 @@ TLS-RPT).
 | **PIPELINING** | A client sends `MAIL`/`RCPT`/`DATA` as one socket write (and, in a second test, the entire `EHLO`…`DATA`…body…`QUIT` session in a single write); all replies come back in order and both messages land on disk. |
 | **DMARC reporting** | Aggregator grouping/counts + JSON persistence across restart; the full send pipeline (MIME + gzip + external-dest consent) through a fake queue; the gzipped attachment is gunzipped and the RFC 7489 XML is parsed and asserted (policy, per-row counts, alignment, `header_from`, `auth_results`); ARF forensic report structure + hourly rate limit. |
 | **ARC** | Cross-validated **both directions** with Python **`dkimpy`**: dkimpy verifies our 1-hop and 2-hop sealed chains (`cv=pass`), and our validator accepts a dkimpy-sealed message. Plus self-tests: seal↔validate round-trip, 2-hop chain, body/seal tamper detection, and cv-chain enforcement. |
-| **E-mail builders** | The full HTML/Text × attachment × PGP matrix (`HermodTests/SMTP/EMailBuilderTests.cs`): each is built, serialized and **re-parsed** (round-trip), PGP signatures are cryptographically verified (key generated in-test), and the multipart tree (`multipart/mixed` and `multipart/signed`) is reconstructed on re-parse. These uncovered and fixed three MIME bugs: `MailContentType.Parse` returning null for `charset=`/`boundary=`-only types, the multipart/signed `Content-Type` header being written without its `boundary=`, and `application/pgp-signature` not mapping to its enum member. |
+| **E-mail builders & OpenPGP** | 33 tests in `HermodTests/SMTP/EMailBuilderTests.cs` (RSA key rings generated in-test). Build side: HTML/Text × attachment × PGP matrix, each built, serialized and **re-parsed** (round-trip) with signatures cryptographically verified and the multipart tree reconstructed; all five `EMailSecurity` modes (incl. `autosign`/`auto` graceful degradation); encryption round-trips that actually **decrypt** back to the plaintext; multi-recipient encryption addressing (and decrypting for) every `To`. Inbound side: `IsPgpSigned`/`IsPgpEncrypted`, `VerifyPgpSignature` (Valid / tampered→Invalid / wrong-key→NoMatchingKey / unsigned→NoSignature / a hand-assembled *foreign* serialization verified via raw bytes), `DecryptPgp`, and `DecryptAndVerifyPgp`. This work uncovered and fixed several real bugs: three MIME re-parse bugs, `EMailSecurity.encrypt` silently sending plaintext, and encrypt addressing only the first `To`. |
 | **DANE / DNSSEC** | Live TLSA lookups + full **DNSSEC chain validation** against real signed zones (`posteo.de`, `mailbox.org` → `Secure`/usable; `gmail.com` → no DANE); deterministic certificate-matcher tests (`3 1 1`/`3 1 2`/`3 0 0`/`3 0 1`, tamper → no match, PKIX-usage ignored, DANE-TA). This work exposed and fixed three DNSSEC-stack bugs in Hermod (missing EDNS DO bit, root-name wire-encoding FORMERR, unsupported RSA-SHA1). |
 | **TLS-RPT (outbound)** | Record parsing, aggregation (successes + typed failures, MX aggregation), and RFC 8460 §4 JSON re-parsed and field-checked; live `_smtp._tls` lookup (`google.com`/`gmail.com` → real `rua`). |
 | **TLS-RPT (inbound)** | Closed-loop ingestion: a gzipped `multipart/report` **and** an uncompressed `application/tlsrpt+json` both parse to the expected session/failure counts and persist; an ordinary message is not misdetected; `ParseJson` tolerates missing fields and rejects garbage. |
