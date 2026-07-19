@@ -298,8 +298,13 @@ still trust them after SPF/DKIM break in transit.
 - **Address parsing** (`MailAddressParser`): RFC 5322 display names, angle
   addresses, quoted local-parts, domain-literals, comments, groups, IDN/UTF-8,
   and comma-aware list splitting.
-- **DSN / bounces** (RFC 3461/3464): delivery-status notifications and
-  `multipart/report` bounces; null sender (`<>`) handled to avoid bounce loops.
+- **DSN / bounces** (RFC 3461/3464): failure/delay/**success** delivery-status
+  notifications and `multipart/report` bounces; a sender can request notifications
+  (`NOTIFY`/`RET`/`ENVID`), which are emitted on `MAIL FROM`/`RCPT TO` only when the
+  remote advertises DSN; null sender (`<>`) handled to avoid bounce loops.
+- **Read receipts** (MDN, RFC 8098): a client can request one (the builder's
+  `DispositionNotificationTo`) and generate one from a received `EMail`
+  (`CreateReadReceipt`, see below).
 - **Outbound queue:** file-persistent, exponential-backoff retries, MX priority
   ordering, per-domain concurrency limits.
 
@@ -410,6 +415,48 @@ MIME part (preserved as `EMailBodypart.RawContent` at parse time), per RFC 1847 
 not a re-serialization of the object model — so it is robust to header ordering,
 whitespace, and boundary differences in third-party mail.
 
+### Delivery & read receipts
+
+**Delivery status notifications (DSN, RFC 3461/3464).** A sender may request
+notifications by passing `DsnParameters` to the send facades; they are attached to
+`MAIL FROM` (`RET`/`ENVID`) and `RCPT TO` (`NOTIFY`/`ORCPT`) **only if the receiving
+server advertises the `DSN` extension**:
+
+```csharp
+await sender.SendAsync(mail,
+    Dsn: new DsnParameters(DsnNotify.Success | DsnNotify.Failure, DsnRet.Full, EnvId: "order-4711"));
+```
+
+`DsnNotify` is a `[Flags]` enum (`Success`/`Failure`/`Delay`, or `Never`). On the
+receiving side the queue emits the matching report and mails it back to the sender
+with a null return-path (loop-safe): a **failure** bounce (default), a **delay**
+warning, or — when `NOTIFY=SUCCESS` was requested — a positive
+`multipart/report; report-type=delivery-status` **delivered** DSN.
+
+**Read receipts (MDN, RFC 8098).** A sender requests one via the builder's
+`DispositionNotificationTo`; a receiving client detects and generates one from the
+parsed `EMail`:
+
+| Member | Purpose |
+|--------|---------|
+| `EMail.IsReadReceiptRequested` / `DispositionNotificationTo` | detect a request |
+| `EMail.CreateReadReceipt(reportingAgent, disposition?, uaProduct?, includeOriginalHeaders?)` | build the MDN (returns null if none was requested) |
+
+```csharp
+if (incoming.IsReadReceiptRequested)
+{
+    var mdn = incoming.CreateReadReceipt(me);   // multipart/report; report-type=disposition-notification
+    if (mdn is not null)
+        await mailer.SubmitAsync(mdn);
+}
+```
+
+The MDN carries the RFC 8098 `message/disposition-notification` part
+(`Disposition: automatic-action/MDN-sent-automatically; displayed`, `Final-Recipient`,
+`Original-Message-ID`) and is stamped `Auto-Submitted: auto-replied` to prevent loops.
+Note that generating an MDN is a **mail-client** concern (the MTA only stores inbound
+mail as `.eml`); these methods exist so a client built on Hermod's `EMail` can do it.
+
 ---
 
 ## Standards conformance
@@ -424,7 +471,8 @@ whitespace, and boundary differences in third-party mail.
 | 2034 | Enhanced status codes | ✅ |
 | 3030 | CHUNKING / BDAT | ✅ |
 | 3207 | STARTTLS | ✅ |
-| 3461 / 3464 | DSN | ✅ |
+| 3461 / 3464 | DSN | ✅ failure/delay/success; sender-requested `NOTIFY`/`RET`/`ENVID` |
+| 8098 | MDN (read receipts) | ✅ request + generate from an `EMail` (client-side) |
 | 4954 | SMTP AUTH | ✅ |
 | 4616 / 7677 / 4422 | PLAIN / SCRAM-SHA-256 / EXTERNAL | ✅ |
 | 6409 | Message submission | ✅ (auth required on 587) |
@@ -672,3 +720,5 @@ core it is designed to be.
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.
 - Anti-spam / greylisting / DNSBL integration.
+- Message **priority**: header-level (`Importance`/`X-Priority`) and the
+  `MT-PRIORITY` ESMTP extension (RFC 6710) with priority-aware queue scheduling.
