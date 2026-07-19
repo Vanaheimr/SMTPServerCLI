@@ -81,7 +81,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         public async Task Start(CancellationToken ct = default)
         {
 
-            _logger.Log(LogLevel.Info, $"Starting SMTP server on ports {serverConfig.Port} and {serverConfig.SubmissionPort}");
+            var implicitTlsEnabled = serverConfig.EnableImplicitTls && _certificate is not null;
+
+            _logger.Log(LogLevel.Info, $"Starting SMTP server on ports {serverConfig.Port} and {serverConfig.SubmissionPort}"
+                                     + (implicitTlsEnabled ? $" and {serverConfig.ImplicitTlsPort} (implicit TLS)" : ""));
             _logger.Log(LogLevel.Info, $"Mail storage: {Path.GetFullPath(serverConfig.MailStoragePath)}");
             _logger.Log(LogLevel.Info, $"STARTTLS: {(_certificate is not null ? "Available" : "Not configured")}");
             _logger.Log(LogLevel.Info, $"AUTH mechanisms: PLAIN, LOGIN, SCRAM-SHA-256, EXTERNAL");
@@ -101,21 +104,33 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             _listeners.Add(listener25);
             _listeners.Add(listener587);
 
-            _logger.Log(LogLevel.Info, "Server started. Waiting for connections...");
+            var sessionLoops = new List<Task>();
 
             // Port 25:  MTA-to-MTA (inbound)
-            var task25   = AcceptConnections(listener25,  isSubmissionPort: false, _cts.Token);
+            sessionLoops.Add(AcceptConnections(listener25,  isSubmissionPort: false, implicitTls: false, _cts.Token));
 
-            // Port 465  "SMTPS": RFC 8314
+            // Port 587: MUA-to-MTA (submission) RFC 6409 — AUTH required, STARTTLS offered.
+            sessionLoops.Add(AcceptConnections(listener587, isSubmissionPort: true,  implicitTls: false, _cts.Token));
 
-            // Port 587: MUA-to-MTA (submission) RFC 6409
-            //           AUTH required
-            //           StartTLS mandatory
-            var task587  = AcceptConnections(listener587, isSubmissionPort: true,  _cts.Token);
+            // Port 465: MUA-to-MTA implicit-TLS submission ("SMTPS", RFC 8314). Only bound when
+            // a certificate is available, since the connection is TLS from the first byte.
+            if (implicitTlsEnabled)
+            {
+                var listener465 = new TcpListener(System.Net.IPAddress.Any, serverConfig.ImplicitTlsPort);
+                listener465.Start();
+                _listeners.Add(listener465);
+                sessionLoops.Add(AcceptConnections(listener465, isSubmissionPort: true, implicitTls: true, _cts.Token));
+            }
+            else if (serverConfig.EnableImplicitTls)
+            {
+                _logger.Log(LogLevel.Warning, $"Implicit-TLS port {serverConfig.ImplicitTlsPort} not bound: no certificate configured");
+            }
+
+            _logger.Log(LogLevel.Info, "Server started. Waiting for connections...");
 
             try
             {
-                await Task.WhenAll(task25, task587);
+                await Task.WhenAll(sessionLoops);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -126,10 +141,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         private async Task AcceptConnections(TcpListener        listener,
                                              Boolean            isSubmissionPort,
+                                             Boolean            implicitTls,
                                              CancellationToken  ct)
         {
 
-            var portType = isSubmissionPort ? "Submission" : "MTA";
+            var portType = implicitTls ? "SMTPS" : isSubmissionPort ? "Submission" : "MTA";
 
             while (!ct.IsCancellationRequested)
             {
@@ -150,8 +166,16 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (rateLimitResult != RateLimitResult.Allowed)
                     {
 
-                        _logger.Log(LogLevel.Warning, 
+                        _logger.Log(LogLevel.Warning,
                             $"[{portType}] Connection rejected from {endpoint.Address}: {rateLimitResult}");
+
+                        // On the implicit-TLS port the client expects a TLS handshake first, so a
+                        // plaintext rejection banner would just corrupt the connection — close it.
+                        if (implicitTls)
+                        {
+                            client.Close();
+                            continue;
+                        }
 
                         // Send rejection message and close
                         try
@@ -190,7 +214,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                         isSubmissionPort,
                                         _connectionTracker,
                                         _rateLimitConfig,
-                                        _logger
+                                        _logger,
+                                        implicitTls
                                     );
 
                     var task      = session.HandleAsync(ct);

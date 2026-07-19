@@ -41,7 +41,7 @@ reference implementations.
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| `SMTPServer` | `SMTPServerCLI/SMTPServer/SMTPServer.cs` | TCP listeners for the MTA (25) and submission (587) ports |
+| `SMTPServer` | `SMTPServerCLI/SMTPServer/SMTPServer.cs` | TCP listeners for the MTA (25), submission (587) and implicit-TLS submission (465) ports |
 | `SMTPSession` | `SMTPSession.cs` | Per-connection state machine, command handling, DATA/BDAT |
 | `SmtpAuthManager` + handlers | `SMTPAuth.cs` | SASL PLAIN / LOGIN / SCRAM-SHA-256 / EXTERNAL |
 | `DNSVerifier` | `DNSVerifications/DNSVerifier.cs` | SPF, DKIM, DMARC, MX/A/AAAA/PTR — all via the Hermod `DNSClient` |
@@ -88,8 +88,7 @@ calls in the active code.
 - UTF-8 preserved on both the `DATA` and `BDAT` paths; CRLF forced independent
   of host OS.
 
-> **Not advertised:** `PIPELINING` (RFC 2920) and implicit-TLS submission on
-> port 465 (RFC 8314) are not implemented.
+> **Not advertised:** `PIPELINING` (RFC 2920) is not implemented.
 
 ---
 
@@ -116,7 +115,14 @@ production.
 
 ## Transport security (TLS)
 
-- **STARTTLS** (RFC 3207) on both ports, TLS 1.2 / 1.3.
+- **STARTTLS** (RFC 3207) on the MTA (25) and submission (587) ports, TLS 1.2 / 1.3.
+- **Implicit TLS** (RFC 8314) on the submission port **465**: the connection is
+  TLS from the first byte, with no plaintext `STARTTLS` upgrade (so no
+  downgrade-stripping window). The port is only bound when a certificate is
+  configured; disable it with `EnableImplicitTls = false`. On this port
+  `STARTTLS` is not advertised (already encrypted) and cleartext-sensitive AUTH
+  (`PLAIN`/`LOGIN`) is available immediately. Both STARTTLS and implicit TLS
+  share one handshake path (`SMTPSession.EstablishTlsAsync`).
 - **Inbound** certificate: loaded from a PKCS#12 file; a self-signed cert is
   auto-generated for testing. Replace with a real certificate for the MX
   hostname in production.
@@ -230,7 +236,7 @@ written into an `Authentication-Results` header
 | 7435 | Opportunistic security (TLS) | ✅ outbound cert policy |
 | 7489 | DMARC | ✅ identifier alignment + PSL; ⚠️ no `rua`/`ruf` reports |
 | 2920 | PIPELINING | ❌ not implemented |
-| 8314 | Implicit TLS (port 465) | ❌ not implemented |
+| 8314 | Implicit TLS (port 465) | ✅ implicit-TLS submission |
 | 8617 | ARC | ❌ not implemented |
 
 ---
@@ -250,6 +256,7 @@ scratchpad (`dnstest/`, `pgp_smtp_test.py`, `dkim_sign.py`, `dkim_verify.py`).
 | **DNS** | Live queries via the Hermod **`DNSClient`** against real domains (gmail.com, google.com, `dns.google`, `one.one.one.one`). |
 | **Address parser** | 20 unit assertions incl. the previously-broken cases (`user@localhost`, `user+tag@`, quoted local-parts, domain-literals, IDN, groups). |
 | **Outbound TLS** | Tested against our own self-signed server: opportunistic → `Success 250`; strict → `TempFail 454`. |
+| **Implicit TLS (465)** | A real `SslStream` client handshakes from the first byte, receives the `220` greeting and `EHLO` response over TLS, and confirms `STARTTLS` is not advertised while `AUTH PLAIN/LOGIN` is; the plaintext 587 port still advertises `STARTTLS`. |
 
 ---
 
@@ -262,6 +269,7 @@ Configured via environment variables (see `SMTPServerCLI/Program.cs`):
 | `SMTP_HOSTNAME` | `localhost` | Server hostname (used in banners, HELO, Received) |
 | `SMTP_PORT` | `2525` | MTA port (use **25** in production) |
 | `SMTP_SUBMISSION_PORT` | `2587` | Submission port (use **587** in production) |
+| `SMTP_IMPLICIT_TLS_PORT` | `2465` | Implicit-TLS submission port (use **465** in production; needs a certificate) |
 | `SMTP_MAIL_PATH` | `./mailstore` | Storage dir (`.eml` files, `users.txt`, DKIM keys) |
 | `SMTP_LOCAL_DOMAINS` | `<hostname>` | Comma/space list of domains delivered locally |
 | `DKIM_DOMAIN` | `<hostname>` | DKIM `d=` domain |
@@ -376,10 +384,10 @@ Send a test message to a Gmail account and read the *Show original* →
 1. **Real TLS certificate** for `mail.example.com` (e.g. Let's Encrypt); load it
    as PKCS#12 and point `CertificatePath`/`CertificatePassword` at it. Do not
    ship the self-signed default.
-2. **Bind to ports 25 and 587** (and, if you add it, 465). This needs elevated
-   privileges or a capability/`setcap`; or run behind a port-forward.
-3. **Open the firewall** for 25/587 inbound and **25 outbound** (many networks
-   block outbound 25 — you then need a smarthost).
+2. **Bind to ports 25, 587 and 465** (465 needs a certificate). This needs
+   elevated privileges or a capability/`setcap`; or run behind a port-forward.
+3. **Open the firewall** for 25/587/465 inbound and **25 outbound** (many
+   networks block outbound 25 — you then need a smarthost).
 4. **Static IP with matching PTR** (see DNS guide) and not on any blocklist.
 5. **Replace the demo user store** and rotate DKIM keys periodically.
 6. **Monitor** the queue, logs, and DMARC/TLS reports.
@@ -419,7 +427,7 @@ core it is designed to be.
 - DMARC aggregate/forensic (`rua`/`ruf`) report generation. _(Identifier
   alignment and the Public Suffix List are now implemented.)_
 - ARC ([RFC 8617](https://www.rfc-editor.org/rfc/rfc8617)) for forwarding.
-- PIPELINING (RFC 2920), implicit-TLS on 465 (RFC 8314), TLS-RPT (RFC 8460).
+- PIPELINING (RFC 2920), TLS-RPT (RFC 8460).
 - DANE / TLSA ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672)).
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.

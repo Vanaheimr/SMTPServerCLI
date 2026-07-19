@@ -23,6 +23,18 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         public required String    Hostname                  { get; init; }
         public          UInt16    Port                      { get; init; } = 25;
         public          UInt16    SubmissionPort            { get; init; } = 587;
+
+        /// <summary>
+        /// Implicit-TLS submission port (RFC 8314 "SMTPS"): the whole connection is TLS from
+        /// the first byte, no plaintext STARTTLS upgrade. Only bound when a certificate is
+        /// configured and <see cref="EnableImplicitTls"/> is true.
+        /// </summary>
+        public          UInt16    ImplicitTlsPort           { get; init; } = 465;
+
+        /// <summary>
+        /// Whether to bind the implicit-TLS submission port (requires a certificate).
+        /// </summary>
+        public          Boolean   EnableImplicitTls         { get; init; } = true;
         public          String    MailStoragePath           { get; init; } = "./mailstore";
         public          String?   CertificatePath           { get; init; }
         public          String?   CertificatePassword       { get; init; }

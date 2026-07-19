@@ -49,7 +49,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                     Boolean             isSubmissionPort,
                                     ConnectionTracker?  connectionTracker,
                                     RateLimitConfig     rateLimitConfig,
-                                    ILogger             logger)
+                                    ILogger             logger,
+                                    Boolean             implicitTls = false)
     {
 
         private Stream                         _stream         = client.GetStream();
@@ -96,6 +97,27 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             try
             {
+                // Implicit TLS (RFC 8314): the connection is TLS from the very first byte,
+                // established before the greeting — there is no plaintext STARTTLS exchange.
+                if (implicitTls)
+                {
+                    if (certificate is null)
+                    {
+                        logger.Log(LogLevel.Error, "Implicit-TLS connection but no certificate configured; closing");
+                        return;
+                    }
+
+                    try
+                    {
+                        await EstablishTlsAsync(ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.Log(LogLevel.Error, $"Implicit TLS handshake failed: {ex.Message}");
+                        return;
+                    }
+                }
+
                 await SendResponseAsync(220, $"{config.Hostname} ESMTP AchimSMTP ready");
 
                 while (!ct.IsCancellationRequested && client.Connected)
@@ -388,42 +410,53 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             try
             {
-
-                var sslStream = new SslStream(_stream, false, ValidateClientCertificate);
-
-                await sslStream.AuthenticateAsServerAsync(
-                    new SslServerAuthenticationOptions
-                    {
-                        ServerCertificate = certificate,
-                        ClientCertificateRequired = false,  // Optional client cert for EXTERNAL auth
-                        EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 | 
-                                              System.Security.Authentication.SslProtocols.Tls13
-                    },
-                    ct
-                );
-
-                _stream = sslStream;
-                _reader = new StreamReader(sslStream, Encoding.Latin1);
-                _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true, NewLine = "\r\n" };
-                _tlsActive = true;
+                await EstablishTlsAsync(ct);
+                // RFC 3207 §4.2: the client must reset its protocol state after STARTTLS.
                 _state = SMTPSessionState.Connected;
-
-                // Capture client certificate for EXTERNAL auth
-                if (sslStream.RemoteCertificate is X509Certificate remoteCert)
-                {
-                    _clientCertificate = new X509Certificate2(remoteCert);
-                    _authManager.SetClientCertificate(_clientCertificate);
-                    logger.Log(LogLevel.Info, $"Client certificate: {_clientCertificate.Subject} (Thumbprint: {_clientCertificate.Thumbprint[..8]}...)");
-                }
-
-                logger.Log(LogLevel.Info, $"TLS established: {sslStream.SslProtocol}, {sslStream.NegotiatedCipherSuite}");
-
             }
             catch (Exception ex)
             {
                 logger.Log(LogLevel.Error, $"TLS handshake failed: {ex.Message}");
                 throw;
             }
+
+        }
+
+        /// <summary>
+        /// Perform the server-side TLS handshake on the current stream and switch the reader/
+        /// writer over to the encrypted stream. Shared by STARTTLS (RFC 3207) and implicit TLS
+        /// (RFC 8314); the caller is responsible for any protocol handshake around it.
+        /// </summary>
+        private async Task EstablishTlsAsync(CancellationToken ct)
+        {
+
+            var sslStream = new SslStream(_stream, false, ValidateClientCertificate);
+
+            await sslStream.AuthenticateAsServerAsync(
+                new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = certificate,
+                    ClientCertificateRequired = false,  // Optional client cert for EXTERNAL auth
+                    EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 |
+                                          System.Security.Authentication.SslProtocols.Tls13
+                },
+                ct
+            );
+
+            _stream = sslStream;
+            _reader = new StreamReader(sslStream, Encoding.Latin1);
+            _writer = new StreamWriter(sslStream, Encoding.Latin1) { AutoFlush = true, NewLine = "\r\n" };
+            _tlsActive = true;
+
+            // Capture client certificate for EXTERNAL auth
+            if (sslStream.RemoteCertificate is X509Certificate remoteCert)
+            {
+                _clientCertificate = new X509Certificate2(remoteCert);
+                _authManager.SetClientCertificate(_clientCertificate);
+                logger.Log(LogLevel.Info, $"Client certificate: {_clientCertificate.Subject} (Thumbprint: {_clientCertificate.Thumbprint[..8]}...)");
+            }
+
+            logger.Log(LogLevel.Info, $"TLS established: {sslStream.SslProtocol}, {sslStream.NegotiatedCipherSuite}");
 
         }
 

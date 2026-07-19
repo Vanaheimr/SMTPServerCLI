@@ -45,8 +45,9 @@ var mailStoragePath   = Environment.GetEnvironmentVariable("SMTP_MAIL_PATH") ?? 
 var smtpServerConfig  = new SMTPServerConfig {
 
                             Hostname                 = hostname,
-                            Port                     = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT"),            out var p)   ? p  : (UInt16) 2525,
-                            SubmissionPort           = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_SUBMISSION_PORT"), out var sp)  ? sp : (UInt16) 2587,
+                            Port                     = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT"),               out var p)   ? p   : (UInt16) 2525,
+                            SubmissionPort           = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_SUBMISSION_PORT"),    out var sp)  ? sp  : (UInt16) 2587,
+                            ImplicitTlsPort          = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_IMPLICIT_TLS_PORT"),  out var ip)  ? ip  : (UInt16) 2465,
                             MailStoragePath          = mailStoragePath,
                             CertificatePath          = certPath,
                             CertificatePassword      = certPassword,
@@ -149,6 +150,7 @@ Console.WriteLine($"""
       Hostname:       {smtpServerConfig.Hostname}
       SMTP Port:      {smtpServerConfig.Port}
       Submission:     {smtpServerConfig.SubmissionPort}
+      Implicit TLS:   {(smtpServerConfig.EnableImplicitTls && smtpServerConfig.CertificatePath is not null ? smtpServerConfig.ImplicitTlsPort.ToString() : "off")}
       Local Domains:  {String.Join(", ", smtpServerConfig.LocalDomains)}
       Mail Storage:   {Path.GetFullPath(smtpServerConfig.MailStoragePath)}
       TLS Available:  {smtpServerConfig.CertificatePath is not null}
