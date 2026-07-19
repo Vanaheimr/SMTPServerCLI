@@ -75,10 +75,10 @@ public sealed class EMailMessage
                 switch (name.ToLowerInvariant())
                 {
                     case "from":
-                        message.From = ExtractEmailAddress(value);
+                        message.From = MailAddressParser.ParseSingle(value);
                         break;
                     case "to":
-                        message.To.AddRange(ExtractEmailAddresses(value));
+                        message.To.AddRange(MailAddressParser.ParseAddressList(value));
                         break;
                     case "subject":
                         message.Subject = value;
@@ -92,24 +92,6 @@ public sealed class EMailMessage
 
         return message;
 
-    }
-
-    private static String? ExtractEmailAddress(String value)
-    {
-
-        var match = Regex.Match(value, @"<([^>]+)>");
-        if (match.Success)
-            return match.Groups[1].Value;
-
-        match = Regex.Match(value, @"[\w\.-]+@[\w\.-]+\.\w+");
-        return match.Success ? match.Value : null;
-
-    }
-
-    private static IEnumerable<String> ExtractEmailAddresses(String value)
-    {
-        var matches = Regex.Matches(value, @"[\w\.-]+@[\w\.-]+\.\w+");
-        return matches.Select(m => m.Value);
     }
 
 }
