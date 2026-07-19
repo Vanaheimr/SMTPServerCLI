@@ -10,4 +10,9 @@
     <ProjectReference Include="..\..\libs\Hermod\Hermod\Hermod.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Mozilla Public Suffix List snapshot, embedded for DMARC organizational-domain lookups. -->
+    <EmbeddedResource Include="DNSVerifications\public_suffix_list.dat" />
+  </ItemGroup>
+
 </Project>

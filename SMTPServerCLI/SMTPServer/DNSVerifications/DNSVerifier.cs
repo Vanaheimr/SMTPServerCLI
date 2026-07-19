@@ -45,22 +45,44 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             var spfTask   = VerifySpfAsync(senderDomain, clientIp, mailFrom, heloHostname, ct);
             var dkimTask  = VerifyDkimAsync(message, ct);
-            var dmarcTask = VerifyDmarcAsync(senderDomain, ct);
             var mxTask    = GetMxRecordsAsync(senderDomain, ct);
 
-            await Task.WhenAll(spfTask, dkimTask, dmarcTask, mxTask);
+            await Task.WhenAll(spfTask, dkimTask, mxTask);
+
+            // DMARC is anchored on the RFC5322.From domain (RFC 7489 §6.6.1) and needs the
+            // SPF/DKIM results to compute identifier alignment, so it runs after the others.
+            var fromDomain = DomainOf(message.From);
+            var dmarc      = await VerifyDmarcAsync(
+                                       fromDomain,
+                                       senderDomain,             // envelope MAIL FROM domain (SPF-authenticated)
+                                       spfTask.Result.Result,
+                                       dkimTask.Result.Result,
+                                       dkimTask.Result.Domain,   // d= of the passing DKIM signature
+                                       ct
+                                   );
 
             return new DnsVerificationResult(
                 spfTask.Result.Result,
                 spfTask.Result.Record,
                 dkimTask.Result.Result,
                 dkimTask.Result.Details,
-                dmarcTask.Result.Result,
-                dmarcTask.Result.Policy,
+                dmarc.Result,
+                dmarc.Policy,
                 mxTask.Result,
                 dkimTask.Result.Domain
             );
 
+        }
+
+        // Extract the (lower-cased) domain of an addr-spec such as "alice@example.com".
+        private static String DomainOf(String? address)
+        {
+            if (String.IsNullOrEmpty(address))
+                return "";
+            var at = address.LastIndexOf('@');
+            return at >= 0 && at < address.Length - 1
+                       ? address[(at + 1)..].Trim().TrimEnd('.').ToLowerInvariant()
+                       : "";
         }
 
         #region SPF Verification
@@ -580,51 +602,145 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         #region DMARC Verification
 
+        /// <summary>
+        /// Evaluate DMARC (RFC 7489) for the RFC5322.From domain: locate the policy record
+        /// (falling back to the organizational domain), then test SPF/DKIM identifier
+        /// alignment. DMARC passes when at least one of SPF or DKIM produced a "pass" whose
+        /// authenticated domain is aligned with the From domain. On failure the applicable
+        /// policy (p or, for a sub-domain using the org-domain record, sp) is returned after
+        /// pct sampling.
+        /// </summary>
+        /// <param name="fromDomain">The RFC5322.From header domain.</param>
+        /// <param name="spfAuthDomain">The MAIL FROM domain SPF authenticated.</param>
+        /// <param name="spfResult">The SPF result.</param>
+        /// <param name="dkimResult">The DKIM result.</param>
+        /// <param name="dkimDomain">The d= domain of the evaluated (passing) DKIM signature.</param>
         private async Task<(DmarcResult Result, string? Policy)> VerifyDmarcAsync(
-            string            domain,
+            string            fromDomain,
+            string            spfAuthDomain,
+            SPFResult         spfResult,
+            DkimResult        dkimResult,
+            string?           dkimDomain,
             CancellationToken ct)
         {
             try
             {
-                var dmarcDomain = $"_dmarc.{domain}";
-                var dmarcRecord = await GetTxtRecordAsync(dmarcDomain, "v=DMARC1", ct);
+                if (string.IsNullOrEmpty(fromDomain))
+                    return (DmarcResult.None, null);
 
-                if (dmarcRecord is null)
+                // DMARC record for the From domain itself, else the organizational domain
+                // (RFC 7489 §6.6.3). The org-domain record's sp= governs sub-domains.
+                var record        = await GetTxtRecordAsync($"_dmarc.{fromDomain}", "v=DMARC1", ct);
+                var usedOrgRecord = false;
+
+                if (record is null)
                 {
-                    // Try organizational domain
-                    var orgDomain = GetOrganizationalDomain(domain);
-                    if (orgDomain != domain)
+                    var orgDomain = PublicSuffixList.GetOrganizationalDomain(fromDomain);
+                    if (!orgDomain.Equals(fromDomain, StringComparison.OrdinalIgnoreCase))
                     {
-                        dmarcDomain = $"_dmarc.{orgDomain}";
-                        dmarcRecord = await GetTxtRecordAsync(dmarcDomain, "v=DMARC1", ct);
+                        record        = await GetTxtRecordAsync($"_dmarc.{orgDomain}", "v=DMARC1", ct);
+                        usedOrgRecord = true;
                     }
                 }
 
-                if (dmarcRecord is null)
+                if (record is null)
                     return (DmarcResult.None, null);
 
-                var policy = ExtractDmarcPolicy(dmarcRecord);
-                Logger.Log(LogLevel.Debug, $"DMARC record for {domain}: {dmarcRecord}");
+                Logger.Log(LogLevel.Debug, $"DMARC record for {fromDomain}: {record}");
 
-                return (DmarcResult.Pass, policy);
+                var dmarc  = ParseDmarcRecord(record);
+                var policy = (usedOrgRecord && dmarc.SubdomainPolicy is not null)
+                                 ? dmarc.SubdomainPolicy
+                                 : dmarc.Policy;
+
+                // --- identifier alignment (RFC 7489 §3.1) ---
+                var spfAligned  = spfResult  == SPFResult.Pass  && IsAligned(spfAuthDomain, fromDomain, dmarc.StrictSpf);
+                var dkimAligned = dkimResult == DkimResult.Pass && IsAligned(dkimDomain,    fromDomain, dmarc.StrictDkim);
+
+                if (spfAligned || dkimAligned)
+                    return (DmarcResult.Pass, policy);
+
+                // Failing: pct sampling downgrades the enforced policy (RFC 7489 §6.6.4).
+                return (DmarcResult.Fail, ApplyPct(policy, dmarc.Percent));
             }
             catch (Exception ex)
             {
-                Logger.Log(LogLevel.Warning, $"DMARC verification error for {domain}: {ex.Message}");
+                Logger.Log(LogLevel.Warning, $"DMARC verification error for {fromDomain}: {ex.Message}");
                 return (DmarcResult.TempError, null);
             }
         }
 
-        private static string GetOrganizationalDomain(string domain)
+        // RFC 7489 §3.1.1/§3.1.2: an authenticated identifier is aligned with the From domain
+        // if it matches exactly (strict) or shares the same organizational domain (relaxed).
+        private static bool IsAligned(string? authDomain, string fromDomain, bool strict)
         {
-            var parts = domain.Split('.');
-            return parts.Length > 2 ? string.Join('.', parts[^2..]) : domain;
+            if (string.IsNullOrEmpty(authDomain) || string.IsNullOrEmpty(fromDomain))
+                return false;
+
+            if (authDomain.Equals(fromDomain, StringComparison.OrdinalIgnoreCase))
+                return true;   // exact match satisfies both strict and relaxed
+
+            if (strict)
+                return false;
+
+            return PublicSuffixList.GetOrganizationalDomain(authDomain)
+                       .Equals(PublicSuffixList.GetOrganizationalDomain(fromDomain), StringComparison.OrdinalIgnoreCase);
         }
 
-        private static string ExtractDmarcPolicy(string record)
+        // pct% of failing messages get the published policy; the remainder are demoted one
+        // step: reject -> quarantine, quarantine -> none (RFC 7489 §6.6.4).
+        private static string ApplyPct(string policy, int percent)
         {
-            var match = Regex.Match(record, @"p=(\w+)");
-            return match.Success ? match.Groups[1].Value : "none";
+            if (percent >= 100) return policy;
+            if (percent <= 0)   return "none";
+            if (Random.Shared.Next(100) < percent) return policy;
+
+            return policy switch {
+                "reject"     => "quarantine",
+                "quarantine" => "none",
+                _            => "none"
+            };
+        }
+
+        private readonly record struct DmarcRecord(
+            string  Policy,
+            string? SubdomainPolicy,
+            bool    StrictSpf,
+            bool    StrictDkim,
+            int     Percent,
+            string? Rua,
+            string? Ruf
+        );
+
+        private static DmarcRecord ParseDmarcRecord(string record)
+        {
+            var tags = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var part in record.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var eq = part.IndexOf('=');
+                if (eq > 0)
+                    tags[part[..eq].Trim()] = part[(eq + 1)..].Trim();
+            }
+
+            var policy = tags.GetValueOrDefault("p", "none").ToLowerInvariant();
+            tags.TryGetValue("sp", out var subPolicy);
+
+            var percent = 100;
+            if (tags.TryGetValue("pct", out var pctStr) && int.TryParse(pctStr, out var pctVal))
+                percent = Math.Clamp(pctVal, 0, 100);
+
+            bool Strict(string tag) => tags.TryGetValue(tag, out var v) &&
+                                       v.Trim().Equals("s", StringComparison.OrdinalIgnoreCase);
+
+            return new DmarcRecord(
+                policy,
+                subPolicy?.ToLowerInvariant(),
+                Strict("aspf"),
+                Strict("adkim"),
+                percent,
+                tags.GetValueOrDefault("rua"),
+                tags.GetValueOrDefault("ruf")
+            );
         }
 
         #endregion
