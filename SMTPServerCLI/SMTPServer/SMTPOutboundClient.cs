@@ -110,17 +110,19 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
     public sealed class SMTPOutboundClient
     {
 
-        private readonly SmtpOutboundConfig  _config;
-        private readonly DkimSigner?         __dkimSigner;
-        private readonly MtaStsResolver      _mtaStsResolver;
-        private readonly DaneResolver?       _daneResolver;
-        private readonly DNSClient           _dnsClient;
-        private readonly ILogger             _logger;
+        private readonly SmtpOutboundConfig    _config;
+        private readonly DkimSigner?           __dkimSigner;
+        private readonly MtaStsResolver        _mtaStsResolver;
+        private readonly DaneResolver?         _daneResolver;
+        private readonly Action<TlsRptEvent>?  _tlsRptRecorder;
+        private readonly DNSClient             _dnsClient;
+        private readonly ILogger               _logger;
 
-        public SMTPOutboundClient(SmtpOutboundConfig  config,
-                                  DkimSigner?         _dkimSigner,
-                                  DNSClient           dnsClient,
-                                  ILogger             logger)
+        public SMTPOutboundClient(SmtpOutboundConfig    config,
+                                  DkimSigner?           _dkimSigner,
+                                  DNSClient             dnsClient,
+                                  ILogger               logger,
+                                  Action<TlsRptEvent>?  tlsRptRecorder   = null)
         {
 
             this._config          = config;
@@ -131,6 +133,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
             this._daneResolver    = config.EnableDane
                                         ? new DaneResolver(dnsClient, logger)
                                         : null;
+            this._tlsRptRecorder  = tlsRptRecorder;
 
         }
 
@@ -218,6 +221,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                                recipients,
                                                messageContent,
                                                enforceTls,
+                                               targetDomain,
+                                               mtaStsPolicy.Mode,
                                                ct
                                            );
 
@@ -263,6 +268,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                                                         String[]            recipients,
                                                         String              messageContent,
                                                         Boolean             enforceTls,
+                                                        String              policyDomain,
+                                                        MtaStsMode          stsMode,
                                                         CancellationToken   ct)
         {
 
@@ -281,6 +288,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 {
                     _logger.Log(LogLevel.Error,
                         $"DANE: TLSA records for {mxHost} failed DNSSEC validation ({dane.Detail}); deferring");
+                    // TLS-RPT (RFC 8460 §4.3): a bogus DNSSEC result under DANE.
+                    _tlsRptRecorder?.Invoke(new TlsRptEvent(policyDomain, TlsRptPolicyType.Tlsa, mxHost, null, null, false, "dnssec-invalid"));
                     return SendResult.TempFail(450, $"DANE TLSA validation failed for {mxHost}: {dane.Detail}", mxHost);
                 }
 
@@ -306,6 +315,23 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             _logger.Log(LogLevel.Debug, $"Connecting to {mxHost}:{port}");
             await client.ConnectAsync(mxHost, port, connectCts.Token);
+
+            // TLS-RPT session context (RFC 8460): remember the peer/local IPs and record the
+            // outcome under the policy type that governs this session.
+            var receivingIp = (client.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address.ToString();
+            var sendingIp   = (client.Client.LocalEndPoint  as System.Net.IPEndPoint)?.Address.ToString();
+
+            void RecordTls(Boolean success, String? failureType)
+            {
+                if (_tlsRptRecorder is null)
+                    return;
+                var policyType = daneActive
+                                     ? TlsRptPolicyType.Tlsa
+                                     : stsMode is MtaStsMode.Enforce or MtaStsMode.Testing
+                                         ? TlsRptPolicyType.Sts
+                                         : TlsRptPolicyType.NoPolicyFound;
+                _tlsRptRecorder(new TlsRptEvent(policyDomain, policyType, mxHost, receivingIp, sendingIp, success, failureType));
+            }
 
             Stream stream = client.GetStream();
             // UTF-8 (ASCII-compatible) so SMTPUTF8/8BITMIME bodies relay intact; CRLF forced.
@@ -373,6 +399,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                             // A rejected/mismatched certificate under enforced TLS (including a DANE
                             // TLSA mismatch) must not be bypassed: defer instead of downgrading.
                             var why = daneActive ? "DANE TLSA mismatch" : "certificate validation failed";
+                            RecordTls(false, daneActive ? "validation-failure" : "certificate-not-trusted");
                             return SendResult.TempFail(454, $"TLS {why} for {mxHost}: {ex.Message}", mxHost);
                         }
 
@@ -383,18 +410,23 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                         _logger.Log(LogLevel.Debug,
                             $"TLS established with {mxHost}: {sslStream.SslProtocol}{(daneActive ? " (DANE-authenticated)" : "")}");
 
+                        // TLS-RPT (RFC 8460): a compliant TLS session was established.
+                        RecordTls(true, null);
+
                         // Re-send EHLO after TLS
                         await writer.WriteLineAsync($"EHLO {_config.LocalHostname}");
                         ehloResponse = await ReadMultilineResponseAsync(reader, ct);
                     }
                     else if (mustEnforceTls || _config.RequireStartTls)
                     {
+                        RecordTls(false, "starttls-not-supported");
                         return SendResult.TempFail(454, $"STARTTLS required but failed: {starttlsResponse}", mxHost);
                     }
 
                 }
                 else if (mustEnforceTls || _config.RequireStartTls)
                 {
+                    RecordTls(false, "starttls-not-supported");
                     return SendResult.TempFail(454,
                         daneActive
                             ? $"DANE requires STARTTLS but {mxHost} does not offer it"

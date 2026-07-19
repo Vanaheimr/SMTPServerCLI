@@ -276,29 +276,5 @@ public sealed partial class MtaStsResolver : IDisposable
 
 #endregion
 
-#region TLSRPT - TLS Reporting (RFC 8460)
-
-/// <summary>
-/// TLS-RPT report for MTA-STS failures
-/// </summary>
-public sealed record TlsRptReport
-{
-    public required string      Domain          { get; init; }
-    public required DateTime    StartTime       { get; init; }
-    public required DateTime    EndTime         { get; init; }
-    public required string      PolicyMode      { get; init; }
-    public required string[]    MxHost          { get; init; }
-    public          int         SuccessCount    { get; set; }
-    public          int         FailureCount    { get; set; }
-    public          List<TlsRptFailure> Failures { get; init; } = [];
-}
-
-public sealed record TlsRptFailure
-{
-    public required string  ResultType      { get; init; }  // e.g., "certificate-expired"
-    public required string  SendingMta      { get; init; }
-    public required string  ReceivingMx     { get; init; }
-    public          int     FailureCount    { get; init; } = 1;
-}
-
-#endregion
+// SMTP TLS Reporting (TLS-RPT, RFC 8460) lives in Reporting/TlsRptReporting.cs
+// (TlsRptResolver / TlsRptAggregator / TlsRptReportJson / TlsRptReportService).

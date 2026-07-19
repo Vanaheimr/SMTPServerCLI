@@ -139,7 +139,28 @@ var outboundConfig = new SmtpOutboundConfig {
     SmartHostPassword  =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST_PASS")
 };
 
-var outboundClient = new SMTPOutboundClient(outboundConfig, dkimSigner, dnsClient, logger);
+// Setup TLS-RPT (RFC 8460) outbound reporting (opt-in via TLSRPT_REPORTING=true)
+TlsRptReportService? tlsRptService = null;
+if (Environment.GetEnvironmentVariable("TLSRPT_REPORTING") == "true")
+{
+
+    var tlsRptEmail   = Environment.GetEnvironmentVariable("TLSRPT_REPORT_EMAIL") ?? $"tls-reports@{hostname}";
+    var tlsRptOptions = new TlsRptReportingOptions(
+                            OrgName:           Environment.GetEnvironmentVariable("TLSRPT_REPORT_ORG") ?? hostname,
+                            ReportFromDisplay: $"TLS Reports <{tlsRptEmail}>",
+                            ReportFromAddress: tlsRptEmail,
+                            ReportingDomain:   hostname,
+                            ContactInfo:       $"postmaster@{hostname}",
+                            Interval:          TimeSpan.FromHours(24));
+
+    var tlsRptAggregator = new TlsRptAggregator(Path.Combine(mailStoragePath, "tlsrpt-state.json"), logger);
+    var tlsRptResolver   = new TlsRptResolver(dnsClient, logger);
+    tlsRptService        = new TlsRptReportService(tlsRptAggregator, tlsRptResolver, mailQueue, tlsRptOptions, logger);
+
+}
+
+var outboundClient = new SMTPOutboundClient(outboundConfig, dkimSigner, dnsClient, logger,
+                                            tlsRptService is not null ? tlsRptService.Record : null);
 
 // Setup bounce handler
 var bounceHandler = new BounceHandler(smtpServerConfig, mailQueue, logger);
@@ -170,6 +191,7 @@ Console.WriteLine($"""
       DMARC Reports:  {(smtpServerConfig.EnableDmarcReporting ? $"on (forensic={smtpServerConfig.EnableDmarcForensic})" : "off")}
       Smarthost:      {outboundConfig.SmartHost ?? "(direct delivery)"}
       DANE (out):     {(outboundConfig.EnableDane ? "on (RFC 7672, DNSSEC TLSA)" : "off")}
+      TLS-RPT (out):  {(tlsRptService is not null ? "on (RFC 8460)" : "off")}
       Relay Auth:     Required (prevents open relay)
     """);
 
@@ -216,6 +238,10 @@ try
 
     // Start queue processor
     await queueProcessor.StartAsync(cts.Token);
+
+    // Start TLS-RPT reporting loop (if enabled)
+    if (tlsRptService is not null)
+        _ = tlsRptService.RunAsync(cts.Token);
 
     // Start SMTP server
     await server.Start(cts.Token);

@@ -53,6 +53,7 @@ reference implementations.
 | `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
 | `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
 | `DaneResolver` + `DaneAuthenticator` | `Dane.cs` | RFC 7672 DNSSEC-validated TLSA lookup + certificate matching |
+| `TlsRptResolver` + `TlsRptAggregator` + `TlsRptReportService` | `Reporting/TlsRptReporting.cs` | RFC 8460 SMTP TLS Reporting (outbound TLS success/failure aggregate reports) |
 | `DmarcReportService` + `DmarcAggregator` | `Reporting/` | RFC 7489 §7 aggregate (RUA) + forensic (RUF/ARF) report generation |
 | `ArcValidator` + `ArcSealer` + `ArcChain` | `Arc/` | RFC 8617 Authenticated Received Chain validation and sealing |
 
@@ -164,6 +165,16 @@ production.
   are returned. The `DNSSECValidator` performs real RRSIG signature verification
   (RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519/Ed448) and DS-based delegation
   walking; it is cross-checked against live signed zones (posteo.de, mailbox.org).
+- **TLS-RPT** ([RFC 8460](https://www.rfc-editor.org/rfc/rfc8460), opt-in via
+  `TLSRPT_REPORTING=true`): the outcome of every outbound TLS session (success or
+  a typed failure — `starttls-not-supported`, `certificate-not-trusted`,
+  `validation-failure`, `dnssec-invalid`) is recorded per recipient domain and
+  policy type (`sts` / `tlsa` / `no-policy-found`). A background loop
+  (`TlsRptReportService`) drains the aggregator once per interval and, for each
+  domain that publishes a `_smtp._tls` policy with an `rua` mailto destination,
+  builds the RFC 8460 §4 JSON, gzips it into an `application/tlsrpt+gzip`
+  `multipart/report`, and enqueues it through the outbound queue (DKIM-signed).
+  Counts are persisted so they survive a restart.
 - **REQUIRETLS** ([RFC 8689](https://www.rfc-editor.org/rfc/rfc8689)): honored on
   `MAIL FROM` and propagated to enforced outbound delivery.
 
@@ -290,7 +301,8 @@ still trust them after SPF/DKIM break in transit.
 | 4616 / 7677 / 4422 | PLAIN / SCRAM-SHA-256 / EXTERNAL | ✅ |
 | 6409 | Message submission | ✅ (auth required on 587) |
 | 8689 | REQUIRETLS | ✅ |
-| 8461 | MTA-STS | ✅ (TLS-RPT not implemented) |
+| 8461 | MTA-STS | ✅ |
+| 8460 | TLS-RPT (SMTP TLS Reporting) | ✅ outbound aggregate reports (opt-in) |
 | 7208 | SPF (incl. macros §7) | ✅ complete |
 | 6376 | DKIM | ✅ complete, cross-validated |
 | 8601 | Authentication-Results | ✅ |
@@ -345,6 +357,9 @@ Configured via environment variables (see `SMTPServerCLI/Program.cs`):
 | `SMTP_SMARTHOST` | – | Optional relay host for outbound |
 | `SMTP_SMARTHOST_PORT` / `_USER` / `_PASS` | `25` / – / – | Smarthost port & credentials |
 | `SMTP_DANE` | – | `true` → enable DANE/TLSA (RFC 7672) DNSSEC-validated TLS pinning for outbound |
+| `TLSRPT_REPORTING` | – | `true` → emit outbound SMTP TLS Reporting (RFC 8460) aggregate reports |
+| `TLSRPT_REPORT_EMAIL` | `tls-reports@<hostname>` | From/return-path for TLS reports |
+| `TLSRPT_REPORT_ORG` | `<hostname>` | `organization-name` in TLS reports |
 | `DMARC_REPORTING` | – | `true` → emit DMARC aggregate (RUA) reports |
 | `DMARC_FORENSIC` | – | `true` → also emit DMARC forensic (RUF/ARF) reports |
 | `DMARC_REPORT_EMAIL` | `dmarc-reports@<hostname>` | From/return-path for reports (its domain must be DKIM-signable) |
@@ -492,8 +507,6 @@ core it is designed to be.
 
 ## Not implemented / roadmap
 
-- TLS-RPT ([RFC 8460](https://www.rfc-editor.org/rfc/rfc8460)) — the reporting
-  layer over DANE/MTA-STS (TLSA/STARTTLS success & failure reports).
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.
 - Anti-spam / greylisting / DNSBL integration.
