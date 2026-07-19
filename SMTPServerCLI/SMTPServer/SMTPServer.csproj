@@ -10,8 +10,4 @@
     <ProjectReference Include="..\..\libs\Hermod\Hermod\Hermod.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Folder Include="NEW\" />
-  </ItemGroup>
-
 </Project>

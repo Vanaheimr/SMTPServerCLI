@@ -29,6 +29,18 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
         public          TimeSpan  SessionTimeout            { get; init; } = TimeSpan.FromMinutes(5);
         public          Int32     MaxMessageSize            { get; init; } = 25 * 1024 * 1024; // 25 MB
         public          Int32     MaxRecipients             { get; init; } = 100;
+
+        /// <summary>
+        /// Maximum length of a command line incl. CRLF (RFC 5321 §4.5.3.1.4 requires ≥ 512;
+        /// larger here to accommodate AUTH exchanges and ESMTP parameters).
+        /// </summary>
+        public          Int32     MaxCommandLineLength      { get; init; } = 1024;
+
+        /// <summary>
+        /// Maximum length of a DATA text line incl. CRLF (RFC 5321 §4.5.3.1.6 recommends 1000;
+        /// defaulted higher to tolerate real-world long-line mail while still bounding memory).
+        /// </summary>
+        public          Int32     MaxTextLineLength         { get; init; } = 2048;
         public          Boolean   RequireStartTls           { get; init; } = false;
         public          Boolean   VerifyDkim                { get; init; } = true;
         public          Boolean   VerifySpf                 { get; init; } = true;

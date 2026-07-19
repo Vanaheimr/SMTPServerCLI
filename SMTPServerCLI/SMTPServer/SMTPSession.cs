@@ -104,6 +104,19 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                     if (line is null)
                         break;
 
+                    // Command line-length limit (RFC 5321 §4.5.3.1.4)
+                    if (line.Length + 2 > config.MaxCommandLineLength)
+                    {
+                        _counters.InvalidCommands++;
+                        await SendResponseAsync(500, "5.5.6 Line too long");
+                        if (_counters.InvalidCommands >= rateLimitConfig.MaxInvalidCommands)
+                        {
+                            await SendResponseAsync(421, "4.7.0 Too many errors, closing connection");
+                            break;
+                        }
+                        continue;
+                    }
+
                     logger.Log(LogLevel.Debug, $"C: {line}");
 
                     // Handle AUTH exchange specially
@@ -589,6 +602,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             var messageBuilder = new StringBuilder();
             var totalSize = 0;
+            int?    errorCode    = null;
+            String? errorMessage = null;
 
             while (!ct.IsCancellationRequested)
             {
@@ -596,26 +611,46 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
                 var line = await ReadLineAsync(ct);
 
                 if (line is null)
-                    break;
+                    break;              // connection lost
 
                 if (line == ".")
-                    break;
+                    break;              // end of data
 
-                // Dot-stuffing: remove leading dot if line starts with ".." (RFC 5321 §4.5.2)
+                // Once an error is flagged, keep consuming until the terminator so the
+                // connection stays in sync; reject only after the whole DATA block is read.
+                if (errorCode is not null)
+                    continue;
+
+                // Text line-length limit (RFC 5321 §4.5.3.1.6), checked on the wire line.
+                if (line.Length + 2 > config.MaxTextLineLength)
+                {
+                    errorCode    = 500;
+                    errorMessage = "5.6.0 Line too long";
+                    continue;
+                }
+
+                // Dot-unstuffing: remove one leading dot (RFC 5321 §4.5.2)
                 if (line.StartsWith('.'))
                     line = line[1..];
 
                 totalSize += line.Length + 2;
                 if (totalSize > config.MaxMessageSize)
                 {
-                    await SendResponseAsync(552, "5.3.4 Message size exceeds maximum");
-                    ResetTransaction();
-                    return;
+                    errorCode    = 552;
+                    errorMessage = "5.3.4 Message size exceeds maximum";
+                    continue;
                 }
 
                 // Always terminate lines with CRLF, independent of the host OS.
                 messageBuilder.Append(line).Append("\r\n");
 
+            }
+
+            if (errorCode is not null)
+            {
+                await SendResponseAsync(errorCode.Value, errorMessage!);
+                ResetTransaction();
+                return;
             }
 
             // The reader uses Latin1 (1 char == 1 wire byte). Reconstruct the original
@@ -806,7 +841,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
             // Prepend trace information (RFC 5321 §4.4). Done after verification so SPF/DKIM/DMARC
             // run on the original message; the stamped copy is what we store and relay.
-            var traceHeaders = await BuildReceivedHeaderAsync(ct);
+            // Authentication-Results (RFC 8601) goes above the Received header of this hop.
+            var traceHeaders = "";
+            if (verification is not null)
+                traceHeaders += BuildAuthenticationResultsHeader(verification, senderDomain);
+            traceHeaders += await BuildReceivedHeaderAsync(ct);
             if (dmarcQuarantine)
                 traceHeaders += "X-DMARC-Quarantine: true\r\n";
 
@@ -881,6 +920,49 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.New
 
         }
 
+
+        /// <summary>
+        /// Build an "Authentication-Results:" header for this hop (RFC 8601) from the
+        /// SPF/DKIM/DMARC verification results. Returned terminated with CRLF.
+        /// </summary>
+        private String BuildAuthenticationResultsHeader(DnsVerificationResult v, String senderDomain)
+        {
+
+            static String Spf(SPFResult r) => r switch {
+                SPFResult.Pass      => "pass",
+                SPFResult.Fail      => "fail",
+                SPFResult.SoftFail  => "softfail",
+                SPFResult.Neutral   => "neutral",
+                SPFResult.TempError => "temperror",
+                SPFResult.PermError => "permerror",
+                _                   => "none"
+            };
+
+            static String Dkim(DkimResult r) => r switch {
+                DkimResult.Pass      => "pass",
+                DkimResult.Fail      => "fail",
+                DkimResult.TempError => "temperror",
+                DkimResult.PermError => "permerror",
+                _                    => "none"
+            };
+
+            static String Dmarc(DmarcResult r) => r switch {
+                DmarcResult.Pass      => "pass",
+                DmarcResult.Fail      => "fail",
+                DmarcResult.TempError => "temperror",
+                DmarcResult.PermError => "permerror",
+                _                     => "none"
+            };
+
+            var mailFrom     = String.IsNullOrEmpty(_mailFrom) ? "<>" : _mailFrom;
+            var dmarcComment = v.DmarcPolicy is not null ? $" (p={v.DmarcPolicy})" : "";
+
+            return $"Authentication-Results: {config.Hostname};\r\n" +
+                   $"\tspf={Spf(v.Spf)} smtp.mailfrom={mailFrom};\r\n" +
+                   $"\tdkim={Dkim(v.Dkim)} header.d={senderDomain};\r\n" +
+                   $"\tdmarc={Dmarc(v.Dmarc)} header.from={senderDomain}{dmarcComment}\r\n";
+
+        }
 
         /// <summary>
         /// Build a "Received:" trace header for this hop (RFC 5321 §4.4).
