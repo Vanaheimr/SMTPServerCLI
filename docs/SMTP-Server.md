@@ -1,11 +1,18 @@
 # Hermod SMTP Server & Client
 
-A from-scratch SMTP server and outbound client built on the
-[Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) libraries (namespace
-`org.GraphDefined.Vanaheimr.Hermod.SMTP.New`). It implements the modern SMTP
-stack — ESMTP, STARTTLS, SASL AUTH, SPF, DKIM, DMARC, MTA-STS, DSN — with a
-strong focus on RFC-correct behaviour, cross-validated against independent
-reference implementations.
+A from-scratch SMTP server and outbound client. The protocol stack **lives in the
+[Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) library** under namespace
+`org.GraphDefined.Vanaheimr.Hermod.SMTP` (folder `Hermod/SMTP/`), replacing
+Hermod's previous SMTP-server implementation; this repository is the thin CLI
+(`SMTPServerCLI/`) that wires and runs it. Pieces that only make sense when
+running an inbound server — the listener, per-connection session, SASL auth,
+connection rate-limiting, mailbox/user storage, and inbound TLS-RPT ingestion —
+live in the child namespace `org.GraphDefined.Vanaheimr.Hermod.SMTP.Server`;
+everything reusable (message model, DKIM/SPF/DMARC/ARC/DANE/TLS-RPT engines, the
+outbound client + queue) stays in `…SMTP`. It implements the modern SMTP
+stack — ESMTP, STARTTLS, implicit TLS, SASL AUTH, SPF, DKIM, DMARC, ARC,
+MTA-STS, DANE, TLS-RPT, DSN — with a strong focus on RFC-correct behaviour,
+cross-validated against independent reference implementations and live domains.
 
 > ### ⚠️ Status: RFC-conformant reference implementation — not a hardened production MX
 >
@@ -39,9 +46,13 @@ reference implementations.
 
 ## Architecture
 
-| Component | File | Purpose |
+All components below live in the Hermod library under `Hermod/SMTP/` (paths in
+the table are relative to that folder); only the CLI entry point
+(`SMTPServerCLI/SMTPServerCLI/Program.cs`) sits in this repository.
+
+| Component | File (under `Hermod/SMTP/`) | Purpose |
 |-----------|------|---------|
-| `SMTPServer` | `SMTPServerCLI/SMTPServer/SMTPServer.cs` | TCP listeners for the MTA (25), submission (587) and implicit-TLS submission (465) ports |
+| `SMTPServer` | `SMTPServer.cs` | TCP listeners for the MTA (25), submission (587) and implicit-TLS submission (465) ports |
 | `SMTPSession` | `SMTPSession.cs` | Per-connection state machine, command handling, DATA/BDAT |
 | `SmtpAuthManager` + handlers | `SMTPAuth.cs` | SASL PLAIN / LOGIN / SCRAM-SHA-256 / EXTERNAL |
 | `DNSVerifier` | `DNSVerifications/DNSVerifier.cs` | SPF, DKIM, DMARC, MX/A/AAAA/PTR — all via the Hermod `DNSClient` |
@@ -327,9 +338,11 @@ still trust them after SPF/DKIM break in transit.
 
 ## Testing & reference implementations
 
-Correctness is validated against **independent** implementations and the RFC
-example vectors, not just self-consistency. Test harnesses live in the
-scratchpad (`dnstest/`, `pgp_smtp_test.py`, `dkim_sign.py`, `dkim_verify.py`).
+Correctness is validated against **independent** implementations, the RFC
+example vectors, and live domains — not just self-consistency. Each feature has a
+throwaway harness (DKIM/ARC via Python `dkimpy`, PGP via GnuPG, and standalone
+.NET projects for SPF macros, the Public Suffix List, DMARC reporting, DANE, and
+TLS-RPT).
 
 | Area | Reference / method |
 |------|--------------------|
@@ -344,12 +357,15 @@ scratchpad (`dnstest/`, `pgp_smtp_test.py`, `dkim_sign.py`, `dkim_verify.py`).
 | **PIPELINING** | A client sends `MAIL`/`RCPT`/`DATA` as one socket write (and, in a second test, the entire `EHLO`…`DATA`…body…`QUIT` session in a single write); all replies come back in order and both messages land on disk. |
 | **DMARC reporting** | Aggregator grouping/counts + JSON persistence across restart; the full send pipeline (MIME + gzip + external-dest consent) through a fake queue; the gzipped attachment is gunzipped and the RFC 7489 XML is parsed and asserted (policy, per-row counts, alignment, `header_from`, `auth_results`); ARF forensic report structure + hourly rate limit. |
 | **ARC** | Cross-validated **both directions** with Python **`dkimpy`**: dkimpy verifies our 1-hop and 2-hop sealed chains (`cv=pass`), and our validator accepts a dkimpy-sealed message. Plus self-tests: seal↔validate round-trip, 2-hop chain, body/seal tamper detection, and cv-chain enforcement. |
+| **DANE / DNSSEC** | Live TLSA lookups + full **DNSSEC chain validation** against real signed zones (`posteo.de`, `mailbox.org` → `Secure`/usable; `gmail.com` → no DANE); deterministic certificate-matcher tests (`3 1 1`/`3 1 2`/`3 0 0`/`3 0 1`, tamper → no match, PKIX-usage ignored, DANE-TA). This work exposed and fixed three DNSSEC-stack bugs in Hermod (missing EDNS DO bit, root-name wire-encoding FORMERR, unsupported RSA-SHA1). |
+| **TLS-RPT (outbound)** | Record parsing, aggregation (successes + typed failures, MX aggregation), and RFC 8460 §4 JSON re-parsed and field-checked; live `_smtp._tls` lookup (`google.com`/`gmail.com` → real `rua`). |
+| **TLS-RPT (inbound)** | Closed-loop ingestion: a gzipped `multipart/report` **and** an uncompressed `application/tlsrpt+json` both parse to the expected session/failure counts and persist; an ordinary message is not misdetected; `ParseJson` tolerates missing fields and rejects garbage. |
 
 ---
 
 ## Configuration
 
-Configured via environment variables (see `SMTPServerCLI/Program.cs`):
+Configured via environment variables (see `SMTPServerCLI/SMTPServerCLI/Program.cs`):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -460,6 +476,31 @@ mx: mail.example.com
 max_age: 604800
 ```
 
+### 7. TLS-RPT (optional) — receive TLS negotiation reports
+
+```dns
+_smtp._tls.example.com. IN TXT "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+```
+
+Senders that support TLS-RPT (Google, Microsoft, …) will then send daily
+aggregate reports about the success/failure of their TLS connections to your MX.
+Point `rua` at a local mailbox and run with `TLSRPT_INGEST=true` to have the
+server parse and store them under `<mailstore>/tls-reports-received/`.
+
+### 8. DANE / TLSA (optional, **requires DNSSEC**) — pin your MX certificate
+
+If your zone is DNSSEC-signed, you can publish a TLSA record so senders
+authenticate your MX certificate via DANE (RFC 7672). For a typical
+`3 1 1` record (DANE-EE, SubjectPublicKeyInfo, SHA-256):
+
+```dns
+_25._tcp.mail.example.com. IN TLSA 3 1 1 <sha256-hex-of-cert-SubjectPublicKeyInfo>
+```
+
+This is independent of the server's **outbound** DANE support, which validates
+*other* domains' TLSA records automatically when `SMTP_DANE=true` (no records of
+your own needed for that).
+
 ### Verify your setup
 
 ```sh
@@ -467,6 +508,7 @@ dig +short MX      example.com
 dig +short TXT     example.com                     # SPF
 dig +short TXT     default._domainkey.example.com  # DKIM
 dig +short TXT     _dmarc.example.com              # DMARC
+dig +short TXT     _smtp._tls.example.com          # TLS-RPT
 dig +short -x      192.0.2.10                      # PTR
 ```
 
