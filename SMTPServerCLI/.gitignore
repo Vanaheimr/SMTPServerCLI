@@ -1,0 +1,4 @@
+# Runtime data — received mail (.eml), the outbound queue, users.txt (credential hashes),
+# and reporting state. Not intended to be committed. The config/ folder (crypto material) IS
+# tracked; see config/README.md.
+mailstore/

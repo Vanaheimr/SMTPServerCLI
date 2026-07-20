@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/Dependencies/">
+    <Project Path="libs/Hermod/Hermod/Hermod.csproj" />
+    <Project Path="libs/Hermod/HermodTests/HermodTests.csproj" />
+    <Project Path="libs/Styx/Styx/Styx.csproj" />
+    <Project Path="libs/Styx/StyxTests/StyxTests.csproj" />
+  </Folder>
+  <Project Path="SMTPServerCLI/SMTPServerCLI.csproj" />
+</Solution>
