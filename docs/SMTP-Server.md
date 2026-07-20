@@ -68,7 +68,7 @@ the table are relative to that folder); only the CLI entry point
 | `SpfMacros` | `DNSVerifications/SpfMacros.cs` | RFC 7208 §7 macro expansion |
 | `MailAddressParser` | `MailAddressParser.cs` | RFC 5322 From/To address parsing |
 | `MailSender` | `MailSender.cs` | MTA outbound entry point for typed `EMail`/`EMailEnvelop` (Hermod.Mail builders): `SendAsync` = queued "letter" delivery; `SendDirectAsync` = synchronous direct-to-MX with a per-domain `SendResult` |
-| `ISMTPClient` / `SMTPClient` / `NullMailer` | `SMTPClient/` | Submission (RFC 6409) client: an app hands a typed message to one configured submission server (587/465, STARTTLS/implicit TLS + SASL AUTH incl. SCRAM-SHA-256), synchronous, returns a `MailSentStatus` (or a detailed `SMTPSendResult` via `SendWithResult`) — the interface an app injects for transactional mail (used by Hermod's HTTP API) |
+| `ISMTPSubmissionClient` / `SMTPSubmissionClient` / `NullMailer` | `SMTPSubmissionClient/` | Submission (RFC 6409) client: an app hands a typed message to one configured submission server (587/465, STARTTLS/implicit TLS + SASL AUTH incl. SCRAM-SHA-256), synchronous, returns a `MailSentStatus` (or a detailed `SMTPSendResult` via `SendWithResult`) — the interface an app injects for transactional mail (used by Hermod's HTTP API) |
 | `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay (raw-string `SendAsync` is `internal`) |
 | `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue (priority-ordered), retries, DSN failure/delay/success reports |
 | `EMail` + builders + `OpenPGP` | `EMail/`, `BouncyCastle/OpenPGP*.cs` | Typed message model: HTML/text/multipart/attachments, OpenPGP sign/encrypt + inbound verify/decrypt (RFC 3156), read receipts (RFC 8098), importance (RFC 2156) |
@@ -331,7 +331,7 @@ attachments, OpenPGP) — those produce a typed `EMail`/`EMailEnvelop`. Then cho
 | Mode | API | Semantics — what you get back | "Accepted now" means |
 |------|-----|-------------------------------|----------------------|
 | **① Letter** | `MailSender.SendAsync` | Fire into the queue; delivered eventually in the background; failures surface **later** as a DSN bounce to the sender | *(nothing synchronous — you learn of failure via a bounce)* |
-| **② Submission** | `ISMTPClient.Send` (`SMTPClient`) | Synchronous; hand the message to one configured submission server (587/465, STARTTLS + SASL AUTH) and get its verdict now (`MailSentStatus`) | *your outgoing server* accepted it — it still delivers onward later |
+| **② Submission** | `ISMTPSubmissionClient.Send` (`SMTPSubmissionClient`) | Synchronous; hand the message to one configured submission server (587/465, STARTTLS + SASL AUTH) and get its verdict now (`MailSentStatus`) | *your outgoing server* accepted it — it still delivers onward later |
 | **③ Hand-delivered** | `MailSender.SendDirectAsync` | Synchronous direct-to-MX; you get the **recipient MX's** verdict now (`SendResult` per domain) | *the recipient's mail server* accepted it right now |
 
 Rule of thumb: **bulk/newsletter/notifications → ①**; **an app sending transactional
@@ -349,7 +349,7 @@ mail.AddAttachment(pdfBytes, "rechnung.pdf");
 await new MailSender(mailQueue, logger).SendAsync(mail);
 
 // ② Submission — hand to my configured outgoing server (STARTTLS + AUTH), know its verdict now.
-ISMTPClient smtp = new SMTPClient(
+ISMTPSubmissionClient smtp = new SMTPSubmissionClient(
     DomainName.Parse("smtp.example.com"), IPPort.Parse(587),
     Login: "app", Password: "…", UseTLS: TLSUsage.STARTTLS, DNSClient: dnsClient);
 var r2 = await smtp.Send(mail);                    // NullMailer for tests / no-mail
@@ -367,17 +367,53 @@ var r3 = await sender.SendDirectAsync(mail);
 if (!r3.All(d => d.IsOk)) { /* d.TargetDomain, d.Result.ResponseCode, d.Result.ResponseText */ }
 ```
 
-`ISMTPClient` (with the no-op `NullMailer`) is the app→submission-server client:
-it talks to one configured host with SASL AUTH over TLS (SCRAM-SHA-256 preferred;
-never cleartext), requests DSN/MT-PRIORITY/REQUIRETLS from the envelope, and
-detects a dropped or stalled connection immediately (`MailSentStatus.ConnectionClosed`
-/ `.Timeout`). `Send` returns the coarse `MailSentStatus`; `SendWithResult` returns a
-richer `SMTPSendResult` (final SMTP reply, RFC 3463 enhanced status, per-recipient
-`RCPT TO` verdicts, attempts, TLS/auth state, runtime) that still implicitly reduces
-to `MailSentStatus` for legacy call sites. It is distinct from `SMTPOutboundClient`, the MTA→MTA relay engine
-(MX lookup, opportunistic TLS/DANE/MTA-STS) that `MailSender` drives for modes ① and ③.
-The raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and hand-crafting a
-`QueuedMail`) are `internal`, so a caller cannot inject an unchecked message string.
+#### `SMTPSubmissionClient` vs. `SMTPOutboundClient` — two different SMTP roles
+
+The stack has **two** SMTP-sending clients, and they are deliberately separate
+types because they play the two distinct roles the SMTP architecture itself
+defines (RFC 5321 §2.3.10, RFC 6409). They are *not* interchangeable, and the
+naming now makes that explicit:
+
+- **`SMTPSubmissionClient`** (implements `ISMTPSubmissionClient`; `NullMailer` is
+  the no-op test double) is a **Message Submission Agent client (app → MSA,
+  RFC 6409)**. Your application hands it a finished message and it delivers that
+  message to **one configured, trusted submission server** (your outgoing mail
+  server) — authenticating as *you*. It is what an app injects for transactional
+  mail; Hermod's own HTTP API uses it.
+- **`SMTPOutboundClient`** is a **relay engine (MTA → MTA)**. It takes an already-
+  accepted message and pushes it toward the **recipient's** mail server: it does
+  the MX lookup, applies the opportunistic/enforced-TLS + DANE + MTA-STS policy,
+  DKIM-signs, and reports a per-domain verdict. It is driven by `MailSender` and
+  the queue for modes ① and ③ above; you rarely call it directly.
+
+| | `SMTPSubmissionClient` (submission, RFC 6409) | `SMTPOutboundClient` (relay, MTA→MTA) |
+|---|---|---|
+| **Role** | app → MSA (your outgoing server) | MTA → MX (the recipient's server) |
+| **Peer** | *one* configured submission host | *many*, resolved per recipient domain |
+| **Port** | 587 (STARTTLS) / 465 (implicit TLS) | 25 |
+| **MX lookup** | no — the host is given | yes — MX/A per domain |
+| **Authentication** | **required** — SASL AUTH as you (SCRAM-SHA-256 preferred, never cleartext) | none — MTAs don't authenticate to each other |
+| **TLS policy** | mandatory before AUTH | opportunistic by default; enforced under MTA-STS / DANE / REQUIRETLS |
+| **DKIM signing** | no (already trusted by the MSA) | yes (signs on the way out) |
+| **DANE / MTA-STS** | not applicable | yes |
+| **Verdict** | the MSA's reply now (`MailSentStatus` / detailed `SMTPSendResult`) | per-recipient-domain `SendResult` |
+| **Who drives it** | your application, directly | `MailSender` + the outbound queue |
+
+Mnemonic: a **submission** client *submits* your mail to your own server to send
+on your behalf; an **outbound** (relay) client *relays* it the last hop to the
+recipient. Modes ① and ③ are `SMTPOutboundClient` under the hood; mode ② is
+`SMTPSubmissionClient`.
+
+`SMTPSubmissionClient` additionally requests DSN/MT-PRIORITY/REQUIRETLS from the
+envelope, detects a dropped or stalled connection immediately
+(`MailSentStatus.ConnectionClosed` / `.Timeout`), retries only transient transport
+failures, and runs fully-async I/O. `Send` returns the coarse `MailSentStatus`;
+`SendWithResult` returns a richer `SMTPSendResult` (final SMTP reply, RFC 3463
+enhanced status, per-recipient `RCPT TO` verdicts, attempts, TLS/auth state,
+runtime) that still implicitly reduces to `MailSentStatus` for legacy call sites.
+The relay client's raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and
+hand-crafting a `QueuedMail`) are `internal`, so a caller cannot inject an
+unchecked message string.
 
 ### Secure mail (OpenPGP / PGP-MIME, RFC 3156)
 
@@ -484,7 +520,7 @@ if (incoming.IsReadReceiptRequested)
 {
     var mdn = incoming.CreateReadReceipt(me);   // multipart/report; report-type=disposition-notification
     if (mdn is not null)
-        await smtp.Send(mdn);                   // via ISMTPClient, or MailSender for queued delivery
+        await smtp.Send(mdn);                   // via ISMTPSubmissionClient, or MailSender for queued delivery
 }
 ```
 
