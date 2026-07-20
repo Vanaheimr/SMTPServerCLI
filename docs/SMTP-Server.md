@@ -4,7 +4,8 @@ A from-scratch SMTP server and outbound client. The protocol stack **lives in th
 [Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) library** under namespace
 `org.GraphDefined.Vanaheimr.Hermod.SMTP` (folder `Hermod/SMTP/`), replacing
 Hermod's previous SMTP-server implementation; this repository is the thin CLI
-(`SMTPServerCLI/`) that wires and runs it. Pieces that only make sense when
+([`SMTPServerCLI/`](../SMTPServerCLI/SMTPServerCLI/README.md)) that wires and
+runs it — a self-contained, config-in-code server instance. Pieces that only make sense when
 running an inbound server — the listener, per-connection session, SASL auth,
 connection rate-limiting, mailbox/user storage, and inbound TLS-RPT ingestion —
 live in the child namespace `org.GraphDefined.Vanaheimr.Hermod.SMTP.Server`;
@@ -56,7 +57,8 @@ inbound verify/decrypt), read receipts (MDN), and message importance/priority.
 
 All components below live in the Hermod library under `Hermod/SMTP/` (paths in
 the table are relative to that folder); only the CLI entry point
-(`SMTPServerCLI/SMTPServerCLI/Program.cs`) sits in this repository.
+([`SMTPServerCLI/SMTPServerCLI/`](../SMTPServerCLI/SMTPServerCLI/README.md) —
+`Program.cs` + `Configuration.cs`) sits in this repository.
 
 | Component | File (under `Hermod/SMTP/`) | Purpose |
 |-----------|------|---------|
@@ -173,7 +175,7 @@ production.
   fetched via `_mta-sts` TXT + `https://mta-sts.<domain>/.well-known/mta-sts.txt`;
   MX hosts are filtered against the policy in enforce mode.
 - **DANE** ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672) / [RFC 6698](https://www.rfc-editor.org/rfc/rfc6698),
-  opt-in via `SMTP_DANE=true`): before delivering to an MX, `DaneResolver`
+  opt-in via `Configuration.EnableDane`): before delivering to an MX, `DaneResolver`
   (`Dane.cs`) looks up `_25._tcp.<mx>` TLSA records and **DNSSEC-validates** them
   with Hermod's `DNSSECValidator` (full chain of trust to the IANA root).
   - *Secure* TLSA records → STARTTLS is **enforced** and the server certificate
@@ -191,7 +193,7 @@ production.
   (RSA-SHA1/256/512, ECDSA P-256/P-384, Ed25519/Ed448) and DS-based delegation
   walking; it is cross-checked against live signed zones (posteo.de, mailbox.org).
 - **TLS-RPT** ([RFC 8460](https://www.rfc-editor.org/rfc/rfc8460), opt-in via
-  `TLSRPT_REPORTING=true`): the outcome of every outbound TLS session (success or
+  `Configuration.EnableTlsRptReporting`): the outcome of every outbound TLS session (success or
   a typed failure — `starttls-not-supported`, `certificate-not-trusted`,
   `validation-failure`, `dnssec-invalid`) is recorded per recipient domain and
   policy type (`sts` / `tlsa` / `no-policy-found`). A background loop
@@ -201,7 +203,7 @@ production.
   `multipart/report`, and enqueues it through the outbound queue (DKIM-signed).
   Counts are persisted so they survive a restart.
 
-  The **inbound** direction (opt-in via `TLSRPT_INGEST=true`) is handled by
+  The **inbound** direction (opt-in via `Configuration.EnableTlsRptIngestion`) is handled by
   `TlsRptIngestor`: a message delivered to our `_smtp._tls` `rua` mailbox is
   detected (`report-type="tlsrpt"` / `application/tlsrpt` / `TLS-Report-Domain`),
   its `application/tlsrpt+gzip` (or `+json`) part is base64-decoded and gunzipped,
@@ -529,7 +531,7 @@ The MDN carries the RFC 8098 `message/disposition-notification` part
 `Original-Message-ID`) and is stamped `Auto-Submitted: auto-replied` to prevent loops.
 Generating an MDN is normally a **mail-client** concern. As a convenience, the local
 delivery step can also do it automatically: `MdnGeneratingMailStorage` (an
-`IMailStorage` decorator, enabled with `SMTP_AUTO_MDN=true` / `EnableAutoMdn`) emits an
+`IMailStorage` decorator, enabled with `Configuration.EnableAutoMdn`) emits an
 MDN per local recipient when a stored message requested one — reporting disposition
 `processed` / automatic-action (a delivery agent handled it, it was not *displayed*).
 This is opt-in and privacy-sensitive (RFC 8098 §2.1: automatic MDNs confirm a live
@@ -625,42 +627,31 @@ TLS-RPT).
 
 ## Configuration
 
-Configured via environment variables (see `SMTPServerCLI/SMTPServerCLI/Program.cs`):
+The bundled CLI is **configured in code — there are no environment variables.**
+Every setting (hostname, ports, local domains, DKIM domain/selector, the
+verification and reporting flags, smarthost, rate limits, queue tuning) is a
+typed constant in
+[`SMTPServerCLI/SMTPServerCLI/Configuration.cs`](../SMTPServerCLI/SMTPServerCLI/Configuration.cs);
+edit it and rebuild. Crypto material (a self-signed TLS certificate and the DKIM
+key pair) is generated on first run into the git-tracked `config/` folder, so a
+fresh clone runs as-is and the DKIM key can be committed to stay stable.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `SMTP_HOSTNAME` | `localhost` | Server hostname (used in banners, HELO, Received) |
-| `SMTP_PORT` | `2525` | MTA port (use **25** in production) |
-| `SMTP_SUBMISSION_PORT` | `2587` | Submission port (use **587** in production) |
-| `SMTP_IMPLICIT_TLS_PORT` | `2465` | Implicit-TLS submission port (use **465** in production; needs a certificate) |
-| `SMTP_MAIL_PATH` | `./mailstore` | Storage dir (`.eml` files, `users.txt`, DKIM keys) |
-| `SMTP_LOCAL_DOMAINS` | `<hostname>` | Comma/space list of domains delivered locally |
-| `DKIM_DOMAIN` | `<hostname>` | DKIM `d=` domain |
-| `DKIM_SELECTOR` | `default` | DKIM selector |
-| `DKIM_AUTO_GENERATE` | – | `true` → generate a keypair if none exists |
-| `SMTP_SMARTHOST` | – | Optional relay host for outbound |
-| `SMTP_SMARTHOST_PORT` / `_USER` / `_PASS` | `25` / – / – | Smarthost port & credentials |
-| `SMTP_DANE` | – | `true` → enable DANE/TLSA (RFC 7672) DNSSEC-validated TLS pinning for outbound |
-| `TLSRPT_REPORTING` | – | `true` → emit outbound SMTP TLS Reporting (RFC 8460) aggregate reports |
-| `TLSRPT_REPORT_EMAIL` | `tls-reports@<hostname>` | From/return-path for TLS reports |
-| `TLSRPT_REPORT_ORG` | `<hostname>` | `organization-name` in TLS reports |
-| `TLSRPT_INGEST` | – | `true` → ingest inbound TLS-RPT reports (parse + store under `tls-reports-received/`) |
-| `DMARC_REPORTING` | – | `true` → emit DMARC aggregate (RUA) reports |
-| `DMARC_FORENSIC` | – | `true` → also emit DMARC forensic (RUF/ARF) reports |
-| `DMARC_REPORT_EMAIL` | `dmarc-reports@<hostname>` | From/return-path for reports (its domain must be DKIM-signable) |
-| `DMARC_REPORT_ORG` | `<hostname>` | `org_name` in aggregate reports |
-| `SMTP_AUTO_MDN` | – | `true` → auto-generate a read receipt (MDN) on local delivery when the message requested one (opt-in, privacy-sensitive) |
+**See the CLI project's own guide —
+[`SMTPServerCLI/SMTPServerCLI/README.md`](../SMTPServerCLI/SMTPServerCLI/README.md)**
+— for the full settings table, the `config/` vs `mailstore/` folder layout, user
+accounts, and a production deployment walkthrough (privileged ports, real
+certificate, systemd unit).
 
-Ports default to 2525/2587 so the server runs without root. A self-signed TLS
-certificate (`server.pfx`) and default users (`admin`/`user` = `test123`,
-`demo` = `demo`) are generated on first run — **change these before any real
-use.**
+Ports default to 2525/2587/2465 so the server runs without root. Default users
+(`admin`/`user` = `test123`, `demo` = `demo`) are created on first run —
+**change these before any real use.**
 
 ### Run
 
 ```sh
 git submodule update --init --depth 1 libs/Hermod libs/Styx
-dotnet run --project SMTPServerCLI/SMTPServerCLI/SMTPServerCLI.csproj
+cd SMTPServerCLI/SMTPServerCLI
+dotnet run
 ```
 
 ---
@@ -745,8 +736,8 @@ _smtp._tls.example.com. IN TXT "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
 
 Senders that support TLS-RPT (Google, Microsoft, …) will then send daily
 aggregate reports about the success/failure of their TLS connections to your MX.
-Point `rua` at a local mailbox and run with `TLSRPT_INGEST=true` to have the
-server parse and store them under `<mailstore>/tls-reports-received/`.
+Point `rua` at a local mailbox and set `Configuration.EnableTlsRptIngestion = true`
+to have the server parse and store them under `<mailstore>/tls-reports-received/`.
 
 ### 8. DANE / TLSA (optional, **requires DNSSEC**) — pin your MX certificate
 
@@ -759,7 +750,7 @@ _25._tcp.mail.example.com. IN TLSA 3 1 1 <sha256-hex-of-cert-SubjectPublicKeyInf
 ```
 
 This is independent of the server's **outbound** DANE support, which validates
-*other* domains' TLSA records automatically when `SMTP_DANE=true` (no records of
+*other* domains' TLSA records automatically when `Configuration.EnableDane = true` (no records of
 your own needed for that).
 
 ### Verify your setup
