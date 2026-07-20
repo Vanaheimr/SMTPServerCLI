@@ -62,7 +62,7 @@ the table are relative to that folder); only the CLI entry point
 | `SpfMacros` | `DNSVerifications/SpfMacros.cs` | RFC 7208 §7 macro expansion |
 | `MailAddressParser` | `MailAddressParser.cs` | RFC 5322 From/To address parsing |
 | `MailSender` | `MailSender.cs` | MTA outbound entry point for typed `EMail`/`EMailEnvelop` (Hermod.Mail builders): `SendAsync` = queued "letter" delivery; `SendDirectAsync` = synchronous direct-to-MX with a per-domain `SendResult` |
-| `ISMTPClient` / `SMTPClient` / `NullMailer` | `SMTPClient/` | Submission (RFC 6409) client: an app hands a typed message to one configured submission server (587/465, STARTTLS/implicit TLS + SASL AUTH incl. SCRAM-SHA-256), synchronous, returns a `MailSentStatus` — the interface an app injects for transactional mail (used by Hermod's HTTP API) |
+| `ISMTPClient` / `SMTPClient` / `NullMailer` | `SMTPClient/` | Submission (RFC 6409) client: an app hands a typed message to one configured submission server (587/465, STARTTLS/implicit TLS + SASL AUTH incl. SCRAM-SHA-256), synchronous, returns a `MailSentStatus` (or a detailed `SMTPSendResult` via `SendWithResult`) — the interface an app injects for transactional mail (used by Hermod's HTTP API) |
 | `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay (raw-string `SendAsync` is `internal`) |
 | `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue (priority-ordered), retries, DSN failure/delay/success reports |
 | `EMail` + builders + `OpenPGP` | `EMail/`, `BouncyCastle/OpenPGP*.cs` | Typed message model: HTML/text/multipart/attachments, OpenPGP sign/encrypt + inbound verify/decrypt (RFC 3156), read receipts (RFC 8098), importance (RFC 2156) |
@@ -349,6 +349,12 @@ ISMTPClient smtp = new SMTPClient(
 var r2 = await smtp.Send(mail);                    // NullMailer for tests / no-mail
 if (r2 != MailSentStatus.ok) { /* InvalidLogin, ConnectionClosed, Timeout, MessageSizeExceeded, … */ }
 
+// …or the detailed result: final reply + enhanced status + per-recipient verdicts.
+var d2 = await smtp.SendWithResult(mail);          // implicitly reduces to MailSentStatus
+if (!d2.IsSuccess) { /* d2.StatusCode, d2.EnhancedStatusCode, d2.Response, d2.Attempts */ }
+foreach (var r in d2.Recipients)                   // r.Address, r.StatusCode, r.EnhancedStatusCode, r.Accepted
+    log($"{r.Address}: {(r.Accepted ? "accepted" : "rejected")} ({r.EnhancedStatusCode})");
+
 // ③ Hand-delivered — direct to the recipient's MX, synchronous, per-domain verdict now.
 var sender = new MailSender(mailQueue, logger, DirectDeliveryClient: outboundClient);
 var r3 = await sender.SendDirectAsync(mail);
@@ -359,7 +365,10 @@ if (!r3.All(d => d.IsOk)) { /* d.TargetDomain, d.Result.ResponseCode, d.Result.R
 it talks to one configured host with SASL AUTH over TLS (SCRAM-SHA-256 preferred;
 never cleartext), requests DSN/MT-PRIORITY/REQUIRETLS from the envelope, and
 detects a dropped or stalled connection immediately (`MailSentStatus.ConnectionClosed`
-/ `.Timeout`). It is distinct from `SMTPOutboundClient`, the MTA→MTA relay engine
+/ `.Timeout`). `Send` returns the coarse `MailSentStatus`; `SendWithResult` returns a
+richer `SMTPSendResult` (final SMTP reply, RFC 3463 enhanced status, per-recipient
+`RCPT TO` verdicts, attempts, TLS/auth state, runtime) that still implicitly reduces
+to `MailSentStatus` for legacy call sites. It is distinct from `SMTPOutboundClient`, the MTA→MTA relay engine
 (MX lookup, opportunistic TLS/DANE/MTA-STS) that `MailSender` drives for modes ① and ③.
 The raw-string paths (`SMTPOutboundClient.SendAsync(string…)` and hand-crafting a
 `QueuedMail`) are `internal`, so a caller cannot inject an unchecked message string.
