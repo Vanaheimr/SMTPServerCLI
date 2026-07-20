@@ -23,142 +23,132 @@ using System.Security.Cryptography.X509Certificates;
 using org.GraphDefined.Vanaheimr.Hermod.DNS;
 using org.GraphDefined.Vanaheimr.Hermod.SMTP;
 using org.GraphDefined.Vanaheimr.Hermod.SMTP.Server;
+using org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI;
+
+#endregion
+
+// A fully self-contained SMTP server: all configuration lives in Configuration.cs (no environment
+// variables), and the crypto material (TLS certificate + DKIM key pair) is generated on first run
+// into the repo-tracked config/ folder, so a fresh clone runs with a single `dotnet run`.
+
+var logger      = new ConsoleLogger();
+var dnsClient   = new DNSClient();
+
+var configDir   = Configuration.ConfigDirectory;
+var mailStore   = Configuration.MailStoragePath;
+
+Directory.CreateDirectory(configDir);
+Directory.CreateDirectory(mailStore);
+
+
+#region TLS certificate — generate a self-signed one on first run
+
+var certPath      = Path.Combine(configDir, "server.pfx");
+var certPassword  = Configuration.CertificatePassword;
+
+if (!File.Exists(certPath)) {
+    Console.WriteLine($"Generating self-signed TLS certificate for '{Configuration.Hostname}'...");
+    GenerateSelfSignedCertificate(certPath, certPassword, Configuration.Hostname);
+    Console.WriteLine($"  → {certPath}  (replace with a real certificate for production)");
+}
+
+#endregion
+
+#region DKIM key pair — generate on first run, then sign outbound mail
+
+var dkimKeyPath = Path.Combine(configDir, $"dkim_{Configuration.DkimSelector}.private.pem");
+
+if (!File.Exists(dkimKeyPath)) {
+    Console.WriteLine($"Generating DKIM key pair for '{Configuration.DkimDomain}' (selector '{Configuration.DkimSelector}')...");
+    DkimKeyGenerator.SaveKeyPair(configDir, Configuration.DkimDomain, Configuration.DkimSelector);
+    Console.WriteLine($"  → {dkimKeyPath}");
+    Console.WriteLine($"  → publish the DNS TXT record from: {Path.Combine(configDir, $"dkim_{Configuration.DkimSelector}.dns.txt")}");
+}
+
+var dkimSigner = new DkimSigner(new DkimConfig {
+                     Domain         = Configuration.DkimDomain,
+                     Selector       = Configuration.DkimSelector,
+                     PrivateKeyPem  = File.ReadAllText(dkimKeyPath)
+                 }, logger);
 
 #endregion
 
 
-// Generate self-signed certificate for testing if not exists
-var certPath      = Path.Combine(AppContext.BaseDirectory, "server.pfx");
-var certPassword  = "smtp-test-password";
+#region Server configuration
 
-if (!File.Exists(certPath))
-{
-    Console.WriteLine("Generating self-signed certificate for STARTTLS...");
-    GenerateSelfSignedCertificate(certPath, certPassword, "localhost");
-    Console.WriteLine($"Certificate saved to: {certPath}");
-}
+var smtpServerConfig = new SMTPServerConfig {
 
-var dnsClient         = new DNSClient();
-var hostname          = Environment.GetEnvironmentVariable("SMTP_HOSTNAME")  ?? "localhost";
-var mailStoragePath   = Environment.GetEnvironmentVariable("SMTP_MAIL_PATH") ?? "./mailstore";
+    Hostname                 = Configuration.Hostname,
+    Port                     = Configuration.Port,
+    SubmissionPort           = Configuration.SubmissionPort,
+    ImplicitTlsPort          = Configuration.ImplicitTlsPort,
+    MailStoragePath          = mailStore,
+    CertificatePath          = certPath,
+    CertificatePassword      = certPassword,
+    RequireStartTls          = Configuration.RequireStartTls,
+    VerifyDkim               = Configuration.VerifyDkim,
+    VerifySpf                = Configuration.VerifySpf,
+    VerifyDmarc              = Configuration.VerifyDmarc,
+    MaxMessageSize           = Configuration.MaxMessageSize,
+    MaxRecipients            = Configuration.MaxRecipients,
+    SessionTimeout           = Configuration.SessionTimeout,
 
-// Configure the server
-var smtpServerConfig  = new SMTPServerConfig {
+    // Mail to local domains is stored locally; anything else is relay and requires authentication.
+    LocalDomains             = ParseLocalDomains(Configuration.LocalDomains),
+    RequireAuthForRelay      = Configuration.RequireAuthForRelay,
+    RequireAuthOnSubmission  = Configuration.RequireAuthOnSubmission,
 
-                            Hostname                 = hostname,
-                            Port                     = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT"),               out var p)   ? p   : (UInt16) 2525,
-                            SubmissionPort           = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_SUBMISSION_PORT"),    out var sp)  ? sp  : (UInt16) 2587,
-                            ImplicitTlsPort          = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_IMPLICIT_TLS_PORT"),  out var ip)  ? ip  : (UInt16) 2465,
-                            MailStoragePath          = mailStoragePath,
-                            CertificatePath          = certPath,
-                            CertificatePassword      = certPassword,
-                            RequireStartTls          = false,
-                            VerifyDkim               = true,
-                            VerifySpf                = true,
-                            VerifyDmarc              = true,
-                            MaxMessageSize           = 25 * 1024 * 1024,
-                            MaxRecipients            = 100,
-                            SessionTimeout           = TimeSpan.FromMinutes(5),
+    EnableDmarcReporting     = Configuration.EnableDmarcReporting,
+    EnableDmarcForensic      = Configuration.EnableDmarcForensic,
+    DmarcReportEmail         = Configuration.DmarcReportEmail   ?? $"dmarc-reports@{Configuration.Hostname}",
+    DmarcReportOrgName       = Configuration.DmarcReportOrgName ?? Configuration.Hostname,
 
-                            // Local domains - mail to these is stored locally
-                            // Mail to other domains requires authentication (relay)
-                            LocalDomains             = ParseLocalDomains(Environment.GetEnvironmentVariable("SMTP_LOCAL_DOMAINS") ?? hostname),
-                            RequireAuthForRelay      = true,   // MUST be true to prevent open relay!
-                            RequireAuthOnSubmission  = true,
+    EnableTlsRptIngestion    = Configuration.EnableTlsRptIngestion,
+    EnableAutoMdn            = Configuration.EnableAutoMdn
 
-                            // DMARC reporting (RFC 7489 §7) - opt-in
-                            EnableDmarcReporting     = Environment.GetEnvironmentVariable("DMARC_REPORTING") == "true",
-                            EnableDmarcForensic      = Environment.GetEnvironmentVariable("DMARC_FORENSIC")  == "true",
-                            DmarcReportEmail         = Environment.GetEnvironmentVariable("DMARC_REPORT_EMAIL"),
-                            DmarcReportOrgName       = Environment.GetEnvironmentVariable("DMARC_REPORT_ORG"),
-
-                            // TLS-RPT (RFC 8460) inbound report ingestion - opt-in
-                            EnableTlsRptIngestion    = Environment.GetEnvironmentVariable("TLSRPT_INGEST") == "true",
-                            EnableAutoMdn            = Environment.GetEnvironmentVariable("SMTP_AUTO_MDN") == "true"
-
-                        };
-
-var logger = new ConsoleLogger();
-
-// Rate limiting configuration
-var rateLimitConfig = new RateLimitConfig {
-                          MaxTotalConnections           = 100,
-                          MaxConnectionsPerIp           = 10,
-                          MaxConnectionsPerIpPerMinute  = 30,
-                          MaxAuthAttemptsPerIpPerHour   = 10,
-                          MaxMessagesPerIpPerHour       = 50,
-                          MaxInvalidCommands            = 5,
-                          AuthFailDelayMs               = 3000
-                      };
-
-// Setup DKIM signer (optional)
-DkimSigner? dkimSigner = null;
-var dkimKeyPath   = Path.Combine(mailStoragePath, "dkim_default.private.pem");
-var dkimDomain    = Environment.GetEnvironmentVariable("DKIM_DOMAIN")   ?? hostname;
-var dkimSelector  = Environment.GetEnvironmentVariable("DKIM_SELECTOR") ?? "default";
-
-if (File.Exists(dkimKeyPath))
-{
-    var privateKeyPem = File.ReadAllText(dkimKeyPath);
-    dkimSigner = new DkimSigner(new DkimConfig {
-        Domain         = dkimDomain,
-        Selector       = dkimSelector,
-        PrivateKeyPem  = privateKeyPem
-    }, logger);
-}
-else
-{
-
-    Console.WriteLine($"No DKIM key found at {dkimKeyPath}");
-    Console.WriteLine($"Generate with: DkimKeyGenerator.SaveKeyPair(\"{mailStoragePath}\", \"{dkimDomain}\", \"{dkimSelector}\")");
-
-    // Auto-generate DKIM keys for testing
-    if (Environment.GetEnvironmentVariable("DKIM_AUTO_GENERATE") == "true")
-    {
-        Console.WriteLine("Auto-generating DKIM keys...");
-        DkimKeyGenerator.SaveKeyPair(mailStoragePath, dkimDomain, dkimSelector);
-        var privateKeyPem = File.ReadAllText(dkimKeyPath);
-        dkimSigner = new DkimSigner(new DkimConfig {
-            Domain         = dkimDomain,
-            Selector       = dkimSelector,
-            PrivateKeyPem  = privateKeyPem
-        }, logger);
-        Console.WriteLine($"DKIM keys generated. Add DNS record from: {Path.Combine(mailStoragePath, $"dkim_{dkimSelector}.dns.txt")}");
-    }
-
-}
-
-// Setup mail queue
-var mailQueue = new FileMailQueue(mailStoragePath, logger);
-
-// Setup outbound client
-var outboundConfig = new SmtpOutboundConfig {
-    LocalHostname      = hostname,
-    PreferStartTls     = true,
-    RequireStartTls    = false,
-    // DANE (RFC 7672): DNSSEC-validated TLSA pinning for outbound delivery. Opt-in via SMTP_DANE=true.
-    EnableDane         = Environment.GetEnvironmentVariable("SMTP_DANE") == "true",
-    SmartHost          =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST"),
-    SmartHostPort      = UInt16.TryParse(Environment.GetEnvironmentVariable("SMTP_SMARTHOST_PORT"), out var shp) ? shp : (UInt16) 25,
-    SmartHostUsername  =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST_USER"),
-    SmartHostPassword  =                 Environment.GetEnvironmentVariable("SMTP_SMARTHOST_PASS")
 };
 
-// Setup TLS-RPT (RFC 8460) outbound reporting (opt-in via TLSRPT_REPORTING=true)
-TlsRptReportService? tlsRptService = null;
-if (Environment.GetEnvironmentVariable("TLSRPT_REPORTING") == "true")
-{
+var rateLimitConfig = new RateLimitConfig {
+    MaxTotalConnections           = Configuration.MaxTotalConnections,
+    MaxConnectionsPerIp           = Configuration.MaxConnectionsPerIp,
+    MaxConnectionsPerIpPerMinute  = Configuration.MaxConnectionsPerIpPerMinute,
+    MaxAuthAttemptsPerIpPerHour   = Configuration.MaxAuthAttemptsPerIpPerHour,
+    MaxMessagesPerIpPerHour       = Configuration.MaxMessagesPerIpPerHour,
+    MaxInvalidCommands            = Configuration.MaxInvalidCommands,
+    AuthFailDelayMs               = Configuration.AuthFailDelayMs
+};
 
-    var tlsRptEmail   = Environment.GetEnvironmentVariable("TLSRPT_REPORT_EMAIL") ?? $"tls-reports@{hostname}";
+#endregion
+
+#region Outbound queue, relay client and reporting
+
+var mailQueue = new FileMailQueue(mailStore, logger);
+
+var outboundConfig = new SmtpOutboundConfig {
+    LocalHostname      = Configuration.Hostname,
+    PreferStartTls     = Configuration.OutboundPreferStartTls,
+    RequireStartTls    = Configuration.OutboundRequireStartTls,
+    EnableDane         = Configuration.EnableDane,
+    SmartHost          = Configuration.SmartHost,
+    SmartHostPort      = Configuration.SmartHostPort,
+    SmartHostUsername  = Configuration.SmartHostUsername,
+    SmartHostPassword  = Configuration.SmartHostPassword
+};
+
+// TLS-RPT (RFC 8460) outbound reporting.
+TlsRptReportService? tlsRptService = null;
+if (Configuration.EnableTlsRptReporting) {
+
+    var tlsRptEmail   = Configuration.TlsRptReportEmail ?? $"tls-reports@{Configuration.Hostname}";
     var tlsRptOptions = new TlsRptReportingOptions(
-                            OrgName:           Environment.GetEnvironmentVariable("TLSRPT_REPORT_ORG") ?? hostname,
+                            OrgName:           Configuration.TlsRptReportOrgName ?? Configuration.Hostname,
                             ReportFromDisplay: $"TLS Reports <{tlsRptEmail}>",
                             ReportFromAddress: tlsRptEmail,
-                            ReportingDomain:   hostname,
-                            ContactInfo:       $"postmaster@{hostname}",
-                            Interval:          TimeSpan.FromHours(24));
+                            ReportingDomain:   Configuration.Hostname,
+                            ContactInfo:       $"postmaster@{Configuration.Hostname}",
+                            Interval:          Configuration.ReportingInterval);
 
-    var tlsRptAggregator = new TlsRptAggregator(Path.Combine(mailStoragePath, "tlsrpt-state.json"), logger);
+    var tlsRptAggregator = new TlsRptAggregator(Path.Combine(mailStore, "tlsrpt-state.json"), logger);
     var tlsRptResolver   = new TlsRptResolver(dnsClient, logger);
     tlsRptService        = new TlsRptReportService(tlsRptAggregator, tlsRptResolver, mailQueue, tlsRptOptions, logger);
 
@@ -167,115 +157,114 @@ if (Environment.GetEnvironmentVariable("TLSRPT_REPORTING") == "true")
 var outboundClient = new SMTPOutboundClient(outboundConfig, dkimSigner, dnsClient, logger,
                                             tlsRptService is not null ? tlsRptService.Record : null);
 
-// Setup bounce handler
-var bounceHandler = new BounceHandler(smtpServerConfig, mailQueue, logger);
+var bounceHandler  = new BounceHandler(smtpServerConfig, mailQueue, logger);
 
-// Setup queue processor (event-based, no polling)
-var queueProcessorConfig = new QueueProcessorConfig {
-    MaxConcurrentDeliveries  = 10,
-    MaxDeliveriesPerDomain   = 5,
-    SendDelayNotifications   = true
-};
-var queueProcessor = new QueueProcessor(mailQueue, outboundClient, bounceHandler, queueProcessorConfig, logger);
+var queueProcessor = new QueueProcessor(mailQueue, outboundClient, bounceHandler, new QueueProcessorConfig {
+                         MaxConcurrentDeliveries  = Configuration.MaxConcurrentDeliveries,
+                         MaxDeliveriesPerDomain   = Configuration.MaxDeliveriesPerDomain,
+                         SendDelayNotifications   = Configuration.SendDelayNotifications
+                     }, logger);
+
+#endregion
 
 
 Console.WriteLine($"""
-    Configuration:
+
+    Hermod SMTP server — self-contained configuration (edit Configuration.cs)
+
       Hostname:       {smtpServerConfig.Hostname}
       SMTP Port:      {smtpServerConfig.Port}
       Submission:     {smtpServerConfig.SubmissionPort}
       Implicit TLS:   {(smtpServerConfig.EnableImplicitTls && smtpServerConfig.CertificatePath is not null ? smtpServerConfig.ImplicitTlsPort.ToString() : "off")}
       Local Domains:  {String.Join(", ", smtpServerConfig.LocalDomains)}
+      Config folder:  {configDir}
       Mail Storage:   {Path.GetFullPath(smtpServerConfig.MailStoragePath)}
       TLS Available:  {smtpServerConfig.CertificatePath is not null}
       Require TLS:    {smtpServerConfig.RequireStartTls}
       Verify DKIM:    {smtpServerConfig.VerifyDkim}
       Verify SPF:     {smtpServerConfig.VerifySpf}
       Verify DMARC:   {smtpServerConfig.VerifyDmarc}
-      DKIM Signing:   {dkimSigner is not null}
+      DKIM Signing:   on ({Configuration.DkimSelector}._domainkey.{Configuration.DkimDomain})
       DMARC Reports:  {(smtpServerConfig.EnableDmarcReporting ? $"on (forensic={smtpServerConfig.EnableDmarcForensic})" : "off")}
       TLS-RPT Ingest: {(smtpServerConfig.EnableTlsRptIngestion ? "on (RFC 8460 inbound)" : "off")}
       Smarthost:      {outboundConfig.SmartHost ?? "(direct delivery)"}
       DANE (out):     {(outboundConfig.EnableDane ? "on (RFC 7672, DNSSEC TLSA)" : "off")}
       TLS-RPT (out):  {(tlsRptService is not null ? "on (RFC 8460)" : "off")}
+      Auto-MDN:       {(smtpServerConfig.EnableAutoMdn ? "on" : "off")}
       Relay Auth:     Required (prevents open relay)
     """);
 
-static HashSet<String> ParseLocalDomains(String domainsString)
-{
 
-    var domains = domainsString.Split([',', ';', ' '], StringSplitOptions.RemoveEmptyEntries)
-                               .Select(d => d.Trim().ToLowerInvariant())
-                               .Where(d => !String.IsNullOrEmpty(d))
-                               .ToHashSet();
+#region Start-up and graceful shutdown
 
-    // Always include localhost
-    domains.Add("localhost");
-    domains.Add("localhost.localdomain");
-
-    return domains;
-
-}
-
-// Create and start server
 await using var server = new SMTPServer(
                              smtpServerConfig,
                              dnsClient,
-                             mailQueue: mailQueue
+                             logger:          logger,
+                             mailQueue:       mailQueue,
+                             rateLimitConfig: rateLimitConfig
                          );
 
-// Handle shutdown
 var cts = new CancellationTokenSource();
 
-Console.CancelKeyPress += (_, e) =>
-{
+Console.CancelKeyPress += (_, e) => {
     e.Cancel = true;
     Console.WriteLine("\nShutdown requested...");
     cts.Cancel();
 };
 
-AppDomain.CurrentDomain.ProcessExit += (_, _) =>
-{
+AppDomain.CurrentDomain.ProcessExit += (_, _) => {
     cts.Cancel();
 };
 
-try
-{
+try {
 
-    // Start queue processor
     await queueProcessor.StartAsync(cts.Token);
 
-    // Start TLS-RPT reporting loop (if enabled)
     if (tlsRptService is not null)
         _ = tlsRptService.RunAsync(cts.Token);
 
-    // Start SMTP server
     await server.Start(cts.Token);
 
 }
-catch (OperationCanceledException)
-{
+catch (OperationCanceledException) {
     Console.WriteLine("Server stopped gracefully.");
 }
-finally
-{
+finally {
     await queueProcessor.DisposeAsync();
     mailQueue.Dispose();
 }
 
-static void GenerateSelfSignedCertificate(String path, String password, String hostname)
-{
+#endregion
+
+
+#region Helpers
+
+static HashSet<String> ParseLocalDomains(IEnumerable<String> domains) {
+
+    var result = domains.Select(d => d.Trim().ToLowerInvariant())
+                        .Where (d => !String.IsNullOrEmpty(d))
+                        .ToHashSet();
+
+    // Always deliver localhost mail locally.
+    result.Add("localhost");
+    result.Add("localhost.localdomain");
+
+    return result;
+
+}
+
+static void GenerateSelfSignedCertificate(String path, String password, String hostname) {
 
     using var rsa = RSA.Create(4096);
 
     var request = new CertificateRequest(
-        $"CN={hostname}",
-        rsa,
-        HashAlgorithmName.SHA256,
-        RSASignaturePadding.Pkcs1
-    );
+                      $"CN={hostname}",
+                      rsa,
+                      HashAlgorithmName.SHA256,
+                      RSASignaturePadding.Pkcs1
+                  );
 
-    // Add extensions
     request.CertificateExtensions.Add(
         new X509BasicConstraintsExtension(false, false, 0, false)
     );
@@ -289,12 +278,11 @@ static void GenerateSelfSignedCertificate(String path, String password, String h
 
     request.CertificateExtensions.Add(
         new X509EnhancedKeyUsageExtension(
-            [ new("1.3.6.1.5.5.7.3.1") ], // Server Authentication
+            [ new("1.3.6.1.5.5.7.3.1") ],   // Server Authentication
             critical: false
         )
     );
 
-    // Subject Alternative Names
     var sanBuilder = new SubjectAlternativeNameBuilder();
     sanBuilder.AddDnsName(hostname);
     sanBuilder.AddDnsName("localhost");
@@ -302,14 +290,13 @@ static void GenerateSelfSignedCertificate(String path, String password, String h
     sanBuilder.AddIpAddress(System.Net.IPAddress.IPv6Loopback);
     request.CertificateExtensions.Add(sanBuilder.Build());
 
-    // Create certificate
-    var notBefore = DateTimeOffset.UtcNow.AddDays(-1);
-    var notAfter  = DateTimeOffset.UtcNow.AddYears(1);
+    using var cert = request.CreateSelfSigned(
+                         DateTimeOffset.UtcNow.AddDays(-1),
+                         DateTimeOffset.UtcNow.AddYears(1)
+                     );
 
-    using var cert = request.CreateSelfSigned(notBefore, notAfter);
-
-    // Export with private key
-    var pfxBytes = cert.Export(X509ContentType.Pfx, password);
-    File.WriteAllBytes(path, pfxBytes);
+    File.WriteAllBytes(path, cert.Export(X509ContentType.Pfx, password));
 
 }
+
+#endregion

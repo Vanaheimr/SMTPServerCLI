@@ -1,233 +1,117 @@
-# Achim SMTP Server
+# Hermod SMTP Server — CLI
 
-Ein vollständiger SMTP-Server in C# .NET 10 mit StartTLS, SMTP-AUTH, DKIM-Verifizierung und DNS-Validierung.
+A **ready-to-run, self-contained SMTP server** built on the
+[Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) mail stack. This project is the thin runnable
+*instance* — wiring, configuration, and crypto material — meant to be deployed on a real server
+straight from this git repository. The protocol engine (ESMTP, STARTTLS, SASL, SPF/DKIM/DMARC/ARC,
+MTA-STS/DANE/TLS-RPT, DSN/MDN, OpenPGP) lives in Hermod and is documented there:
 
-## Features
+- **[SMTP_SUPPORT.md](../../libs/Hermod/SMTP_SUPPORT.md)** — the per-RFC support reference (what is
+  implemented and how it was validated).
+- **[docs/SMTP-Server.md](../../docs/SMTP-Server.md)** — the operational guide (architecture, the
+  full configuration reference, the **DNS setup guide**, deployment, and API examples).
 
-- **SMTP-Protokoll**: Vollständige Implementierung nach RFC 5321
-- **STARTTLS**: TLS 1.2 und TLS 1.3 Unterstützung
-- **SMTP-AUTH**: PLAIN, LOGIN, SCRAM-SHA-256, EXTERNAL (mTLS)
-- **DKIM-Verifizierung**: Überprüfung von DKIM-Signaturen
-- **SPF-Validierung**: Sender Policy Framework Prüfung
-- **DMARC-Analyse**: Domain-based Message Authentication
-- **MX-Record-Abfrage**: Überprüfung der Sender-DNS-Konfiguration
-- **Dateispeicherung**: E-Mails werden als .eml-Dateien gespeichert
-- **Keine externen Abhängigkeiten**: Pure .NET-Implementierung
+This README only covers what is specific to *this* CLI project.
 
-## Authentifizierungsmechanismen
+## Design: everything in the repository, nothing in the environment
 
-| Mechanismus | Sicherheit | TLS erforderlich | Beschreibung |
-|-------------|------------|------------------|--------------|
-| **PLAIN** | Basis | ✓ Ja | Base64-kodiertes Passwort |
-| **LOGIN** | Basis | ✓ Ja | Zwei-Schritt Base64 (veraltet) |
-| **SCRAM-SHA-256** | Hoch | ✗ Nein | Challenge-Response, kein Passwort übertragen |
-| **EXTERNAL** | Sehr hoch | ✓ Ja (mTLS) | Client-Zertifikat-Authentifizierung |
+The guiding principle is **no fiddling with environment variables on the host**. Everything the
+server needs lives in the repository:
 
-### SCRAM-SHA-256 Vorteile
+- **Configuration is code.** All settings — hostname, ports, local domains, DKIM domain/selector,
+  verification and reporting flags, smarthost, rate limits — are strongly-typed constants in
+  [`Configuration.cs`](Configuration.cs). To reconfigure, edit that file and rebuild. There are **no**
+  environment variables to set.
+- **Crypto is generated into the repo.** On first run the server writes a self-signed TLS certificate
+  and a DKIM key pair into the git-tracked [`config/`](config/) folder. You can then commit them so a
+  fresh clone keeps the same DKIM key (and its published DNS record stays valid). See
+  [`config/README.md`](config/README.md).
 
-- Passwort wird **nie** übertragen (auch nicht als Hash)
-- Server speichert nur `StoredKey` und `ServerKey`
-- Mutual Authentication (Server beweist auch seine Identität)
-- Replay-Angriffe durch Nonces verhindert
-- Sicher auch ohne TLS (aber TLS empfohlen)
+## Quick start
 
-### EXTERNAL (mTLS) Vorteile
-
-- Kein Passwort nötig
-- Zertifikat-basierte Authentifizierung
-- Ideal für Server-zu-Server-Kommunikation
-- Integration mit PKI-Infrastruktur
-
-## Voraussetzungen
-
-- .NET 10 SDK
-- Linux: `dig` Befehl für DNS-Abfragen
-- Windows: `nslookup` für DNS-Abfragen
-
-## Schnellstart
-
-```bash
-# Server starten
-dotnet run --project AchimSmtpServer.csproj
-
-# In einem anderen Terminal: Testclient ausführen
-dotnet run --project TestClient/SmtpTestClient.csproj
+```sh
+git submodule update --init --depth 1 libs/Hermod libs/Styx
+cd SMTPServerCLI/SMTPServerCLI
+dotnet run
 ```
 
-## Konfiguration
+On first run it generates `config/server.pfx` and `config/dkim_default.*`, prints the effective
+configuration, and starts listening. The default ports are the non-privileged **2525 / 2587 / 2465**,
+so it runs anywhere without root.
 
-Der Server kann über Umgebungsvariablen konfiguriert werden:
+> The `config/` and `mailstore/` folders are resolved relative to the **current working directory**,
+> so run from the project directory (as above) in development, or from the published folder in
+> production — the crypto and data folders sit next to the app in both cases.
 
-| Variable | Standard | Beschreibung |
-|----------|----------|--------------|
-| `SMTP_HOSTNAME` | `localhost` | Hostname für HELO/EHLO |
-| `SMTP_PORT` | `2525` | SMTP-Port (25 benötigt Root) |
-| `SMTP_SUBMISSION_PORT` | `2587` | Submission-Port |
-| `SMTP_MAIL_PATH` | `./mailstore` | Speicherort für E-Mails |
+## Configuration
 
-## Benutzer-Verwaltung
+Open [`Configuration.cs`](Configuration.cs) — it is the single source of truth, grouped and commented:
 
-Benutzer werden in `mailstore/users.txt` gespeichert:
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `Hostname` | `localhost` | Banner / EHLO / Received / default DKIM & report domain |
+| `Port` / `SubmissionPort` / `ImplicitTlsPort` | `2525` / `2587` / `2465` | **Production: 25 / 587 / 465** (needs privileges — see below) |
+| `LocalDomains` | `["localhost"]` | Mail to these is delivered locally; everything else is authenticated relay |
+| `RequireAuthForRelay` | `true` | **Keep true** — prevents an open relay |
+| `VerifyDkim` / `VerifySpf` / `VerifyDmarc` | `true` | Inbound authentication checks |
+| `DkimDomain` / `DkimSelector` | `Hostname` / `default` | Outbound DKIM signing (key auto-generated) |
+| `CertificatePassword` | `smtp-test-password` | Protects `config/server.pfx` |
+| `SmartHost*` | `null` | Optional relay host; null = direct-to-MX |
+| `EnableDane` / `EnableTlsRpt*` / `EnableDmarcReporting` / `EnableAutoMdn` | `false` | Opt-in features |
+| Rate limits, queue concurrency, session timeout | see file | Operational tuning |
 
-```
-# Format: username:password_sha256:scram_salt:scram_stored_key:scram_server_key:iterations:cert_thumbprints
+## Folders
 
-admin:a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3:SALT:STOREDKEY:SERVERKEY:4096:
-certuser:::::::AABBCCDD11223344
-```
+| Folder | Contents | Committed? |
+|--------|----------|------------|
+| [`config/`](config/) | TLS certificate + DKIM keys (generated on first run) | tracked — commit the keys when you want them stable |
+| `mailstore/` | Received `.eml`, the outbound queue, `users.txt`, reporting state | **git-ignored** (runtime data, contains credential hashes) |
 
-Beim ersten Start werden automatisch Testbenutzer angelegt:
-- `admin` / `test123`
-- `user` / `test123`  
-- `demo` / `demo`
+## User accounts
 
-## Architektur
+Accounts live in `mailstore/users.txt` (SHA-256 password hashes + SCRAM credentials + optional client-
+certificate thumbprints for SASL `EXTERNAL`). On first run three demo users are created —
+`admin` / `test123`, `user` / `test123`, `demo` / `demo`. **Change them before any real use.**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        SmtpServer                               │
-├─────────────────────────────────────────────────────────────────┤
-│  TcpListener (Port 25/587)                                      │
-│       │                                                         │
-│       ▼                                                         │
-│  SmtpSession ──────────────────────────────────────────────────┤
-│       │                                                         │
-│       ├──► HELO/EHLO                                           │
-│       ├──► STARTTLS ──► SslStream ──► Client Certificate       │
-│       ├──► AUTH ─────► SmtpAuthManager                         │
-│       │                    ├──► PlainAuthHandler               │
-│       │                    ├──► LoginAuthHandler               │
-│       │                    ├──► ScramSha256AuthHandler         │
-│       │                    └──► ExternalAuthHandler            │
-│       ├──► MAIL FROM                                           │
-│       ├──► RCPT TO                                             │
-│       └──► DATA ──► EmailMessage.Parse()                       │
-│                         │                                       │
-│                         ▼                                       │
-│              ┌─────────────────────┐                           │
-│              │   DnsVerifier       │                           │
-│              └─────────────────────┘                           │
-│                         │                                       │
-│                         ▼                                       │
-│              ┌─────────────────────┐                           │
-│              │   FileMailStorage   │                           │
-│              └─────────────────────┘                           │
-└─────────────────────────────────────────────────────────────────┘
-```
+## Running on a real Internet server
 
-## SMTP-Befehle
+1. **Set your identity.** In `Configuration.cs`: `Hostname = "mail.example.com"`,
+   `LocalDomains = ["example.com"]`, `DkimDomain = "example.com"`, and the standard ports
+   `Port = 25`, `SubmissionPort = 587`, `ImplicitTlsPort = 465`. Rebuild.
+2. **Bind privileged ports.** 25/587/465 need elevated privileges — either run with a capability
+   (`sudo setcap 'cap_net_bind_service=+ep' $(which dotnet)` or on the published binary) or put a
+   port-forward in front.
+3. **Use a real TLS certificate.** Replace the self-signed `config/server.pfx` with a real certificate
+   for the MX hostname (e.g. Let's Encrypt, exported as PKCS#12 with `CertificatePassword`).
+4. **Publish DNS.** MX, SPF, the DKIM record from `config/dkim_<selector>.dns.txt`, DMARC, and
+   (optionally) MTA-STS / TLS-RPT / DANE — the full record set and verification commands are in the
+   [DNS setup guide](../../docs/SMTP-Server.md#dns-setup-guide).
+5. **Static IP with matching PTR** (FCrDNS), open the firewall for 25/587/465 inbound and 25 outbound
+   (or configure a `SmartHost`), and don't be on a blocklist.
+6. **Run as a service** (systemd example):
 
-| Befehl | Beschreibung |
-|--------|--------------|
-| `HELO` | Einfache Begrüßung |
-| `EHLO` | Extended HELO mit Capabilities |
-| `STARTTLS` | TLS-Verbindung initiieren |
-| `AUTH` | Authentifizierung starten |
-| `MAIL FROM:` | Absender angeben |
-| `RCPT TO:` | Empfänger angeben |
-| `DATA` | Nachrichteninhalt senden |
-| `RSET` | Transaktion zurücksetzen |
-| `NOOP` | Keine Operation |
-| `QUIT` | Verbindung beenden |
+   ```ini
+   [Unit]
+   Description=Hermod SMTP server
+   After=network-online.target
 
-## AUTH Beispiele
+   [Service]
+   WorkingDirectory=/opt/hermod-smtp        # config/ and mailstore/ live here
+   ExecStart=/usr/bin/dotnet /opt/hermod-smtp/SMTPServerCLI.dll
+   Restart=on-failure
+   AmbientCapabilities=CAP_NET_BIND_SERVICE  # to bind 25/587/465
 
-### AUTH PLAIN
+   [Install]
+   WantedBy=multi-user.target
+   ```
 
-```
-C: AUTH PLAIN AGFkbWluAHRlc3QxMjM=
-S: 235 2.7.0 Authentication successful
-```
+## Status
 
-Der Base64-String enthält: `\0admin\0test123`
+This is an RFC-conformant reference implementation, **not** a hardened production MX: there is no
+anti-spam/abuse layer, recipients are accepted catch-all, and the code has not been security-audited.
+Read the [production-readiness section](../../docs/SMTP-Server.md#production-readiness--limitations)
+before exposing it to untrusted mail.
 
-### AUTH LOGIN
+## License
 
-```
-C: AUTH LOGIN
-S: 334 VXNlcm5hbWU6
-C: YWRtaW4=
-S: 334 UGFzc3dvcmQ6
-C: dGVzdDEyMw==
-S: 235 2.7.0 Authentication successful
-```
-
-### AUTH SCRAM-SHA-256
-
-```
-C: AUTH SCRAM-SHA-256 biwsbj1hZG1pbixyPWNsaWVudE5vbmNl
-S: 334 cj1jbGllbnROb25jZXNlcnZlck5vbmNlLHM9c2FsdCxpPTQwOTY=
-C: Yz1iaXdzLHI9Y2xpZW50Tm9uY2VzZXJ2ZXJOb25jZSxwPVByb29m
-S: 235 2.7.0 Authentication successful dj1TZXJ2ZXJTaWduYXR1cmU=
-```
-
-### AUTH EXTERNAL (mit Client-Zertifikat)
-
-```
-C: AUTH EXTERNAL
-S: 235 2.7.0 Authentication successful
-```
-
-## Client-Zertifikat für EXTERNAL
-
-```bash
-# Client-Zertifikat erstellen
-openssl req -x509 -newkey rsa:2048 -keyout client.key -out client.crt \
-    -days 365 -nodes -subj "/CN=admin"
-
-# Als PKCS#12 exportieren
-openssl pkcs12 -export -out client.pfx -inkey client.key -in client.crt
-
-# Thumbprint anzeigen
-openssl x509 -in client.crt -fingerprint -sha1 -noout
-```
-
-Dann den Thumbprint in `users.txt` eintragen.
-
-## E-Mail-Speicherformat
-
-E-Mails werden mit zusätzlichen Metadaten gespeichert:
-
-```
-X-Envelope-From: sender@example.com
-X-Envelope-To: recipient@localhost
-X-Received-At: 2024-12-23T10:00:00.000Z
-X-SPF-Result: Pass
-X-DKIM-Result: Pass
-X-DMARC-Result: Pass
-X-MX-Records: mail.example.com
-
-From: sender@example.com
-To: recipient@localhost
-Subject: Test
-...
-```
-
-## Sicherheitshinweise
-
-⚠️ **Produktionsempfehlungen:**
-
-1. **Ports**: Verwende die Standardports 25 und 587 (erfordert Root/Admin)
-2. **TLS**: Aktiviere `RequireStartTls = true` für Produktion
-3. **Zertifikat**: Verwende ein gültiges Zertifikat (Let's Encrypt)
-4. **AUTH**: SCRAM-SHA-256 oder EXTERNAL bevorzugen
-5. **Firewall**: Beschränke Zugriff auf vertrauenswürdige IPs
-
-## Erweiterungsmöglichkeiten
-
-- [ ] DMARC-Alignment-Prüfung
-- [ ] ARC (Authenticated Received Chain)
-- [ ] Greylisting
-- [ ] XOAUTH2 / OAUTHBEARER
-- [ ] SMTP-Relay mit AUTH
-- [ ] Maildir-Format
-- [ ] Queue-System für Retry
-- [ ] Prometheus-Metriken
-
-## Lizenz
-
-MIT License
-
----
-
-Erstellt für Achim's EU-Regulierungs- und Infrastruktur-Projekte.
+Apache License 2.0 — see the file headers.
