@@ -16,6 +16,12 @@ behaviour, cross-validated against independent reference implementations and liv
 domains. On the message side it composes and parses OpenPGP/MIME (sign/encrypt +
 inbound verify/decrypt), read receipts (MDN), and message importance/priority.
 
+> **Looking for the standards list?** For a per-RFC support reference — every SMTP,
+> TLS, and email-authentication specification with its support level and how it was
+> validated — see [`SMTP_SUPPORT.md`](https://github.com/Vanaheimr/Hermod/blob/master/SMTP_SUPPORT.md)
+> in the Hermod library. This document is the operational guide (architecture,
+> configuration, DNS, deployment, API examples).
+
 > ### ⚠️ Status: RFC-conformant reference implementation — not a hardened production MX
 >
 > The **protocol layer** is implemented correctly and tested. It can send and
