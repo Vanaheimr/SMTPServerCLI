@@ -53,10 +53,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
     /// Comments and lines this class does not understand are kept as they are.
     /// </para>
     /// <para>
-    /// Left to itself, Hermod writes a file with the demo accounts admin,
-    /// user and demo, whose passwords are in its source and its README, and an
-    /// account any client certificate at all authenticates as. A server that
-    /// relays for whoever authenticates has then relayed for everybody, so the
+    /// Left to itself, Hermod writes a file without accounts (before Hermod
+    /// #104 it wrote the demo accounts admin, user and demo, whose passwords
+    /// were in its source, and that is what <see cref="UserAccount.WellKnownPassword"/>
+    /// still looks out for). A server nobody can sign in to is no use, so the
     /// first start writes the file itself instead, with one account and a
     /// password nobody has seen before - see <see cref="CreateWithFirstAccount"/>.
     /// </para>

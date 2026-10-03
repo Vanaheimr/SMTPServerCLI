@@ -35,15 +35,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
     /// <para>
     /// The session accepts any client certificate in the TLS handshake and
     /// never checks it against a CA, so a certificate is nothing more than a
-    /// key pair somebody made. Hermod's FileUserStore then takes it for an
-    /// account when the account says "*" - any certificate at all - or when
-    /// the certificate's common name is the account's name. Either way
-    /// anybody can make one that works, sign in, and relay.
+    /// key pair somebody made. Hermod's FileUserStore used to take it for an
+    /// account when the account said "*" - any certificate at all - or when
+    /// the certificate's common name was the account's name; since Hermod
+    /// #104 it, too, matches pinned thumbprints only.
     /// </para>
     /// <para>
     /// A thumbprint names one certificate, and the handshake has proved that
-    /// the client holds its private key - that is the one way of matching left
-    /// in here. Passwords are FileUserStore's, unchanged.
+    /// the client holds its private key - that is the one way of matching in
+    /// here. The thumbprints are read through <see cref="UsersFile"/>, the
+    /// parser behind the user command, so what the console lists is what
+    /// authenticates. Passwords are FileUserStore's, unchanged.
     /// </para>
     /// </remarks>
     /// <param name="Users">The accounts.</param>
@@ -82,7 +84,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                                                                 CancellationToken  CancellationToken = default)
         {
 
-            var account = Users.Read().FirstOrDefault(account => account.CertificateThumbprints.Contains(Certificate.Thumbprint, StringComparer.OrdinalIgnoreCase));
+            // SHA-1 (X509Certificate2.Thumbprint) or SHA-256, as Hermod's FileUserStore accepts them.
+            var sha256  = Certificate.GetCertHashString(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            var account = Users.Read().FirstOrDefault(account => account.CertificateThumbprints.Contains(Certificate.Thumbprint, StringComparer.OrdinalIgnoreCase) ||
+                                                                 account.CertificateThumbprints.Contains(sha256,                StringComparer.OrdinalIgnoreCase));
 
             return account is not null
                        ? passwords.GetUserAsync(account.Name, CancellationToken)

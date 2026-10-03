@@ -146,25 +146,25 @@ Implemented in `SmtpAuthManager.cs` and the `*AuthHandler.cs` handlers per [RFC 
 | `PLAIN` | [RFC 4616](https://www.rfc-editor.org/rfc/rfc4616) | yes | Rejected in cleartext (`538`) |
 | `LOGIN` | draft-murchison-sasl-login | yes | Rejected in cleartext |
 | `SCRAM-SHA-256` | [RFC 7677](https://www.rfc-editor.org/rfc/rfc7677) | no | Password never transmitted; mutual auth |
-| `EXTERNAL` | [RFC 4422](https://www.rfc-editor.org/rfc/rfc4422) | yes | Uses the TLS client certificate — currently unreachable, because the server does not request one in the handshake (`ClientCertificateRequired = false`) |
+| `EXTERNAL` | [RFC 4422](https://www.rfc-editor.org/rfc/rfc4422) | yes | Uses the TLS client certificate, matched to an account only by a pinned thumbprint — but the server does not request one in the handshake (`ClientCertificateRequired = false`), so it works only for a client that sends one unasked |
 
-- Submission port (587) requires authentication for `DATA` (RFC 6409) — but
-  not yet for `BDAT`, see [limitations](#production-readiness--limitations).
+- Submission ports (587, 465) require authentication before a message is
+  accepted, by `DATA` or `BDAT` (RFC 6409).
 - Relay to non-local domains requires authentication (no open relay).
-- Per-IP auth-attempt and connection rate limiting (`RateLimitConfig.AuthFailDelayMs`
-  is not applied yet).
+- Per-IP auth-attempt and connection rate limiting; a failed `AUTH` is answered
+  only after `AuthFailDelayMs` (3 s) and counts towards the per-IP limit.
 
-User store is a flat file (`<mailstore>/users.txt`) — unsalted SHA-256 password
-hashes for PLAIN/LOGIN plus SCRAM credentials, and optional client-certificate
-thumbprints for EXTERNAL. **Demonstration grade**; use a real database/LDAP for
-production. Left to itself, Hermod's `FileUserStore` writes demo accounts with
-published passwords (`admin`/`user` = `test123`, `demo` = `demo`) into a missing
-file, and matches a client certificate to an account by its **common name** —
-which anybody can put into a self-signed certificate. The CLI therefore writes
-the file itself on the first start (one account, `admin`, with a random password
-shown once), manages it with its `user` command, and hands the server a
-`PinnedCertificateUserStore` that accepts a client certificate only by a
-thumbprint written down for the account.
+User store is a flat file (`<mailstore>/users.txt`) — SCRAM-SHA-256 credentials
+(salted PBKDF2, which also checks PLAIN/LOGIN passwords), an SHA-256 hash Hermod
+falls back to for accounts without them, and optional client-certificate
+thumbprints (SHA-1 or SHA-256) for EXTERNAL. **Demonstration grade**; use a real
+database/LDAP for production. The CLI writes the file itself on the first start
+(one account, `admin`, with a random password shown once) and manages it with
+its `user` command; it still flags accounts that carry the demo passwords
+(`test123`, `demo`) that older Hermod versions wrote into a missing file. Its
+`PinnedCertificateUserStore` accepts a client certificate only by a thumbprint
+written down for the account - as Hermod's `FileUserStore` now does too - and
+reads the thumbprints the way the `user` command shows them.
 
 ---
 
@@ -229,9 +229,12 @@ thumbprint written down for the account.
   the RFC 8460 §4 JSON is parsed, the raw report is stored under
   `<mailstore>/tls-reports-received/`, and a success/failure summary is logged.
 - **REQUIRETLS** ([RFC 8689](https://www.rfc-editor.org/rfc/rfc8689)): honored on
-  `MAIL FROM`; for mail sent through `MailSender` (`EMailEnvelop.RequireTls`) it
-  is carried to enforced outbound delivery. Inbound mail that is **relayed** does
-  not carry it onto the queue yet (see [limitations](#production-readiness--limitations)).
+  `MAIL FROM` and carried to enforced outbound delivery, both for mail sent
+  through `MailSender` (`EMailEnvelop.RequireTls`) and for inbound mail that is
+  relayed, together with its DSN parameters (`ENVID`, `RET`, `NOTIFY`, `ORCPT`).
+- **Null MX** ([RFC 7505](https://www.rfc-editor.org/rfc/rfc7505)): a recipient
+  domain whose only MX is `0 .` gets no delivery attempt; the message bounces at
+  once (`556 5.1.10`).
 
 ---
 
@@ -601,9 +604,10 @@ await sender.SendAsync(new EMailEnvelop(b) { Priority = 4 });   // MT-PRIORITY=4
 | 2156 | Message importance (`Importance`) | ✅ header-level, build + parse |
 | 4954 | SMTP AUTH | ✅ |
 | 4616 / 7677 | PLAIN / SCRAM-SHA-256 | ✅ |
-| 4422 | EXTERNAL | ⚠️ implemented, unreachable — no client certificate is requested |
-| 6409 | Message submission | ⚠️ auth required on 587 for `DATA`, not yet for `BDAT` |
-| 8689 | REQUIRETLS | ✅ on `MAIL FROM` and for `MailSender`; ⚠️ not propagated on relay |
+| 4422 | EXTERNAL | ⚠️ implemented, pinned thumbprints only; no client certificate is requested |
+| 6409 | Message submission | ✅ auth required on 587/465 for `DATA` and `BDAT` |
+| 8689 | REQUIRETLS | ✅ on `MAIL FROM`, for `MailSender`, and on relay |
+| 7505 | Null MX | ✅ immediate bounce |
 | 8461 | MTA-STS | ✅ |
 | 8460 | TLS-RPT (SMTP TLS Reporting) | ✅ outbound reports + inbound ingestion (opt-in) |
 | 7208 | SPF (incl. macros §7) | ✅ complete |
@@ -842,23 +846,9 @@ Honest list of what stands between this and a production Internet MX:
   have not been fuzzed or reviewed for DoS/injection.
 - **Operational gaps** — no mail-loop/`Received`-hop-count limit,
   no metrics/alerting; queue durability is not battle-tested.
-- **Known gaps in the current Hermod code** (found while bringing the CLI up to
-  date; each is a fix in Hermod, not here):
-  - `BDAT` on the submission ports does not check `RequireAuthOnSubmission`, so
-    an unauthenticated client can deliver to **local** recipients there with
-    `CHUNKING` (relay still requires authentication).
-  - `AUTH EXTERNAL` is unreachable (no client certificate is requested), and
-    `FileUserStore` would match a certificate to an account by its common name;
-    the CLI's `PinnedCertificateUserStore` already only accepts pinned
-    thumbprints.
-  - `REQUIRETLS` and the DSN parameters of inbound mail that is relayed are not
-    carried onto the outbound queue.
-  - `SMTPServerConfig.VerifySpf`/`VerifyDkim`/`VerifyDmarc` and
-    `RateLimitConfig.AuthFailDelayMs` are logged but not applied; the checks
-    always run.
-  - A recipient domain with a null MX (RFC 7505, `0 .`) is deferred and retried
-    instead of bounced at once.
-  - Passwords for PLAIN/LOGIN are stored as unsalted SHA-256.
+- **`AUTH EXTERNAL` is effectively unavailable** — the server does not request a
+  client certificate in the TLS handshake, so only a client that sends one
+  unasked can use it.
 - **Header internationalization** (RFC 2047 encoded-words / RFC 6532) is only
   partially handled.
 
