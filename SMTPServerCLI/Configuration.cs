@@ -19,16 +19,15 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 {
 
     /// <summary>
-    /// The single, self-contained configuration for this SMTP server instance.
+    /// The defaults of this SMTP server instance.
     ///
-    /// Everything the server needs lives here in the repository — there are NO environment variables
-    /// to set on the host. To reconfigure, edit the values below and rebuild. Crypto material (the TLS
-    /// certificate and the DKIM key pair) is generated on first run into the repo-tracked
-    /// <c>config/</c> folder and can then be committed; see <see cref="ConfigDirectory"/>.
-    ///
-    /// The <c>config/</c> and <c>mailstore/</c> folders are resolved relative to the process's current
-    /// working directory, so running from the project directory (dev) or from a published folder
-    /// (production) keeps them next to the application.
+    /// Everything the server needs lives here in the repository - there are NO environment variables
+    /// to set on the host. To change a default for good, edit the values below and rebuild; to change
+    /// one for a single start, the switches (-h lists them) override the most common ones - hostname,
+    /// local domains, ports, certificate, DKIM domain/selector, smarthost, folders and the console
+    /// log level - without writing them anywhere. Crypto material (the TLS certificate and the DKIM
+    /// key pair) is generated on first run into the repo-tracked <c>config/</c> folder and can then be
+    /// committed; see <see cref="ServerSettings.ConfigDirectory"/>.
     /// </summary>
     public static class Configuration
     {
@@ -85,6 +84,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #region Inbound authentication checks (SPF / DKIM / DMARC)
 
+        // Note: Hermod currently runs SPF, DKIM, DMARC and ARC on every inbound message and records the
+        // results in the stored .eml whatever these say - they are passed on and logged, not yet honoured.
         public const Boolean   VerifyDkim             = true;
         public const Boolean   VerifySpf              = true;
         public const Boolean   VerifyDmarc            = true;
@@ -148,7 +149,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         #region SMTP TLS Reporting (RFC 8460) — opt-in
 
         /// <summary>Emit outbound TLS-RPT aggregate reports about our own outbound TLS sessions.</summary>
-        public const Boolean   EnableTlsRptReporting  = false;
+        public static readonly Boolean EnableTlsRptReporting = false;
         /// <summary>Ingest inbound TLS-RPT reports delivered to our reporting mailbox.</summary>
         public const Boolean   EnableTlsRptIngestion  = false;
         /// <summary>From/return-path for outbound TLS reports. Null → <c>tls-reports@&lt;hostname&gt;</c>.</summary>
@@ -182,18 +183,6 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         public static readonly TimeSpan  SessionTimeout      = TimeSpan.FromMinutes(5);
         public static readonly TimeSpan  ReportingInterval   = TimeSpan.FromHours(24);
-
-        #endregion
-
-        #region Repository-local folders (resolved against the current working directory)
-
-        /// <summary>Crypto material (TLS certificate + DKIM keys), generated on first run and committable to the repo.</summary>
-        public static String ConfigDirectory
-            => Path.Combine(Directory.GetCurrentDirectory(), "config");
-
-        /// <summary>Runtime data (received .eml, the outbound queue, users.txt). Not intended to be committed.</summary>
-        public static String MailStoragePath
-            => Path.Combine(Directory.GetCurrentDirectory(), "mailstore");
 
         #endregion
 
