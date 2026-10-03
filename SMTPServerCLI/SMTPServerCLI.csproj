@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="SMTPServerCLITests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\libs\Hermod\Hermod\Hermod.csproj" />
     <ProjectReference Include="..\libs\Styx\Styx\Styx.csproj" />
   </ItemGroup>

@@ -139,7 +139,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         /// exit code to end with - after -h or --version, or a switch that made
         /// no sense.
         /// </summary>
-        private static Int32? Parse(String[]        Arguments,
+        internal static Int32? Parse(String[]        Arguments,
                                     ServerSettings  Settings)
         {
 

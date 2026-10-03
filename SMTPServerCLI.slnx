@@ -6,4 +6,5 @@
     <Project Path="libs/Styx/StyxTests/StyxTests.csproj" />
   </Folder>
   <Project Path="SMTPServerCLI/SMTPServerCLI.csproj" />
+  <Project Path="SMTPServerCLITests/SMTPServerCLITests.csproj" />
 </Solution>
