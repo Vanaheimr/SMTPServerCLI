@@ -147,9 +147,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             var anyCertificate = Accounts.Where(account => account.CertificateThumbprints.Contains("*")).ToArray();
 
             if (anyCertificate.Length > 0)
-                said.Add($"users.txt lets any client certificate at all authenticate as " +
+                said.Add($"users.txt says any client certificate at all may authenticate as " +
                          String.Join(", ", anyCertificate.Select(account => $"'{account.Name}'")) +
-                         " - Hermod's demo file does. This server ignores that: only a certificate whose thumbprint " +
+                         " - older Hermod demo files did. That '*' is ignored: only a certificate whose thumbprint " +
                          "is written down for an account authenticates it. 'user remove <name>' tidies it away.");
 
             if (Server.CertificateSelfSigned && Server.Settings.Hostname != "localhost")

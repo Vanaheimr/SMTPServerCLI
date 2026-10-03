@@ -84,8 +84,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #region Inbound authentication checks (SPF / DKIM / DMARC)
 
-        // Note: Hermod currently runs SPF, DKIM, DMARC and ARC on every inbound message and records the
-        // results in the stored .eml whatever these say - they are passed on and logged, not yet honoured.
+        // False skips the check; the stored .eml then records "none" for it.
         public const Boolean   VerifyDkim             = true;
         public const Boolean   VerifySpf              = true;
         public const Boolean   VerifyDmarc            = true;

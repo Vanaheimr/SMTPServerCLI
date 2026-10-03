@@ -182,10 +182,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
             #endregion
 
-            #region Accounts - one with a made-up password, rather than Hermod's demo accounts
+            #region Accounts - one with a made-up password, rather than none
 
-            // Before the server is made: Hermod writes its demo accounts into
-            // a users.txt it does not find, and leaves one it finds alone.
+            // Before the server is made: Hermod writes a users.txt without
+            // accounts where it finds none - a server nobody can submit to -
+            // and leaves one it finds alone.
             if (Users.CreateWithFirstAccount(FirstAccountName, out var password))
                 FirstAccountPassword = password;
 

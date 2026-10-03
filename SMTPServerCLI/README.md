@@ -162,17 +162,19 @@ thumbprints for SASL `EXTERNAL`. The server re-reads the file whenever it
 changes, so the `user` command takes effect at the next AUTH without a restart.
 
 On the first start the CLI writes the file itself, with the single account
-`admin` and a random password. Without this step, Hermod would create its demo
-accounts (`admin` / `user` = `test123`, `demo` = `demo`), whose passwords are
-published. An existing file is left alone, but accounts that still have one of
-those passwords are flagged in the banner and by `user list`.
+`admin` and a random password. Without this step, Hermod would write a file
+without any accounts, and nobody could submit or relay. An existing file is left
+alone. Older Hermod versions wrote demo accounts with published passwords
+(`admin` / `user` = `test123`, `demo` = `demo`) into it; accounts that still
+have one of those passwords are flagged in the banner and by `user list`.
 
-A client certificate authenticates an account only if its **thumbprint** is
-listed for that account. Hermod's own store would also accept any certificate
-whose common name matches the account name, so the CLI replaces that lookup with
-[`PinnedCertificateUserStore`](PinnedCertificateUserStore.cs). (`AUTH EXTERNAL`
-is currently unreachable anyway, because the server does not request a client
-certificate. See the limitations in the [operational guide](../README.md#production-readiness--limitations).)
+A client certificate authenticates an account only if its **thumbprint**
+(SHA-1 or SHA-256) is listed for that account. The CLI checks this with
+[`PinnedCertificateUserStore`](PinnedCertificateUserStore.cs), which reads the
+thumbprints the same way `user list` shows them; Hermod's own store does the
+same since Hermod #104. (`AUTH EXTERNAL` is not usable yet anyway, because the
+server does not request a client certificate. See the limitations in the
+[operational guide](../README.md#production-readiness--limitations).)
 
 Generated passwords are the safer choice. A password typed after `user add` or
 `user passwd` stays in the command line's history until the server stops.
@@ -225,7 +227,6 @@ production MX. It has no anti-spam or abuse layer, accepts any recipient at a
 local domain (catch-all), and has not been security-audited. Before exposing it
 to untrusted mail, read the
 [production-readiness section](../README.md#production-readiness--limitations).
-That section includes the known gaps in the current Hermod code.
 
 ## License
 

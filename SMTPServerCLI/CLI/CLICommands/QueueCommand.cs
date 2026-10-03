@@ -170,7 +170,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                     return [
                         $"  id             {mail.Id}",
                         $"  status         {mail.Status}",
-                        $"  from           {mail.EnvelopeFrom}",
+                        $"  from           {Sender(mail)}",
                         $"  to             {String.Join(", ", mail.EnvelopeTo)}",
                         $"  domain         {mail.TargetDomain}",
                         $"  subject        {subject?["Subject:".Length..].Trim() ?? "(none)"}",
@@ -342,6 +342,18 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #endregion
 
+        #region (private static) Sender(Mail)
+
+        /// <summary>
+        /// The envelope sender as SMTP writes it - "<>" for the null sender of
+        /// a bounce, rather than nothing at all.
+        /// </summary>
+        private static String Sender(QueuedMail Mail)
+
+            => Mail.EnvelopeFrom.Length > 0 ? Mail.EnvelopeFrom : "<>";
+
+        #endregion
+
         #region (private static) Line(Mail)
 
         /// <summary>
@@ -350,7 +362,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         /// </summary>
         private static String Line(QueuedMail Mail)
 
-            => $"  {Mail.Id[..Math.Min(20, Mail.Id.Length)]}  {Mail.Status,-9} {Mail.EnvelopeFrom} -> {String.Join(", ", Mail.EnvelopeTo)}" +
+            => $"  {Mail.Id[..Math.Min(20, Mail.Id.Length)]}  {Mail.Status,-9} {Sender(Mail)} -> {String.Join(", ", Mail.EnvelopeTo)}" +
                (Mail.Status is QueueItemStatus.Pending or QueueItemStatus.Deferred
                     ? $", attempt {Mail.RetryCount + 1} at {Mail.NextRetry.ToLocalTime():HH:mm:ss}"
                     : "") +

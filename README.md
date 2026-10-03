@@ -146,7 +146,7 @@ Implemented in `SmtpAuthManager.cs` and the `*AuthHandler.cs` handlers per [RFC 
 | `PLAIN` | [RFC 4616](https://www.rfc-editor.org/rfc/rfc4616) | yes | Rejected in cleartext (`538`) |
 | `LOGIN` | draft-murchison-sasl-login | yes | Rejected in cleartext |
 | `SCRAM-SHA-256` | [RFC 7677](https://www.rfc-editor.org/rfc/rfc7677) | no | Password never transmitted; mutual auth |
-| `EXTERNAL` | [RFC 4422](https://www.rfc-editor.org/rfc/rfc4422) | yes | Uses the TLS client certificate, matched to an account only by a pinned thumbprint — but the server does not request one in the handshake (`ClientCertificateRequired = false`), so it works only for a client that sends one unasked |
+| `EXTERNAL` | [RFC 4422](https://www.rfc-editor.org/rfc/rfc4422) | yes | Uses the TLS client certificate, matched to an account only by a pinned thumbprint — but the server does not request one in the handshake (`ClientCertificateRequired = false`), and a TLS client sends a certificate only when asked, so it is not usable yet |
 
 - Submission ports (587, 465) require authentication before a message is
   accepted, by `DATA` or `BDAT` (RFC 6409).
@@ -846,9 +846,10 @@ Honest list of what stands between this and a production Internet MX:
   have not been fuzzed or reviewed for DoS/injection.
 - **Operational gaps** — no mail-loop/`Received`-hop-count limit,
   no metrics/alerting; queue durability is not battle-tested.
-- **`AUTH EXTERNAL` is effectively unavailable** — the server does not request a
-  client certificate in the TLS handshake, so only a client that sends one
-  unasked can use it.
+- **`AUTH EXTERNAL` is not usable yet** — the server does not request a client
+  certificate in the TLS handshake, and a TLS client sends one only in answer to
+  such a request (RFC 5246 §7.4.6, RFC 8446 §4.4.2), so no certificate ever
+  arrives.
 - **Header internationalization** (RFC 2047 encoded-words / RFC 6532) is only
   partially handled.
 
