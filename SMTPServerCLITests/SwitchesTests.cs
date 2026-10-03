@@ -47,7 +47,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI.Tests
 
         /// <summary>
         /// The switches of a real start end up in the settings, and the DKIM
-        /// domain follows the hostname unless it was given.
+        /// domain is the domain the mail is from - the first local one.
         /// </summary>
         [Test]
         public void TheSwitchesOfARealStartEndUpInTheSettings()
@@ -69,7 +69,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI.Tests
             Assert.Multiple(() => {
                 Assert.That(exitCode,                    Is.Null);
                 Assert.That(settings.Hostname,           Is.EqualTo("mail.example.org"));
-                Assert.That(settings.DkimDomain,         Is.EqualTo("mail.example.org"));
+                Assert.That(settings.DkimDomain,         Is.EqualTo("example.org"));
                 Assert.That(settings.LocalDomains,       Is.EquivalentTo(new[] { "example.org", "example.net" }));
                 Assert.That(settings.Port,               Is.EqualTo(25));
                 Assert.That(settings.SubmissionPort,     Is.EqualTo(587));
@@ -83,15 +83,19 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI.Tests
 
         }
 
-        [Test]
-        public void ADkimDomainGivenStaysItsOwn()
-        {
+        /// <summary>
+        /// The DKIM domain: what --dkim-domain says; else the first local
+        /// domain other than localhost; else the hostname.
+        /// </summary>
+        [TestCase(new[] { "--hostname", "mail.example.org", "--dkim-domain", "Example.NET." },                  "example.net")]
+        [TestCase(new[] { "--hostname", "mail.example.org", "--local-domain", "example.org" },                  "example.org")]
+        [TestCase(new[] { "--local-domain", "localhost", "--local-domain", "b.example", "--local-domain", "a.example" }, "b.example")]
+        [TestCase(new[] { "--hostname", "mail.example.org", "--local-domain", "localhost" },                    "mail.example.org")]
+        [TestCase(new[] { "--hostname", "mail.example.org" },                                                   "mail.example.org")]
+        [TestCase(new String[0],                                                                                "localhost")]
+        public void TheDkimDomainIsTheDomainTheMailIsFrom(String[] Arguments, String Expected)
 
-            var (_, settings) = Parse("--hostname", "mail.example.org", "--dkim-domain", "example.org");
-
-            Assert.That(settings.DkimDomain, Is.EqualTo("example.org"));
-
-        }
+            => Assert.That(Parse(Arguments).Settings.DkimDomain, Is.EqualTo(Expected));
 
         [Test]
         public void AnAuthorizedKeyIsRememberedForTheStart()

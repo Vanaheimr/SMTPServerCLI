@@ -208,7 +208,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI.Tests
                 Assert.That(server.Users.Read().Select(a => a.Name), Is.EquivalentTo(new[] { "admin", "bob" }));
                 Assert.That(queue.Single(),                      Does.StartWith("Nothing waits to go out."));
                 Assert.That(dns,                                 Has.Some.StartsWith("example.org.  IN MX   10 mail.example.org."));
-                Assert.That(dns,                                 Has.Some.StartsWith("default._domainkey.mail.example.org.  IN TXT  ( \"v=DKIM1; k=rsa; p="));
+                Assert.That(dns,                                 Has.Some.StartsWith("default._domainkey.example.org.  IN TXT  ( \"v=DKIM1; k=rsa; p="));
                 Assert.That(log.Single(),                        Is.EqualTo("The console shows the log from warning up now."));
                 Assert.That(server.Logger.MinimumLevel,          Is.EqualTo(LogLevel.Warning));
                 Assert.That(who.Single(),                        Does.StartWith("Nobody is signed in over SSH"));

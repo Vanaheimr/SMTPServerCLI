@@ -53,8 +53,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         /// <summary>Implicit-TLS submission port; only bound when there is a certificate.</summary>
         public UInt16           ImplicitTlsPort           { get; set; } = Configuration.ImplicitTlsPort;
 
-        /// <summary>Domains delivered locally. "localhost" and "localhost.localdomain" are always added.</summary>
-        public HashSet<String>  LocalDomains              { get; set; } = [.. Configuration.LocalDomains];
+        /// <summary>Domains delivered locally, in the order given. "localhost" and "localhost.localdomain" are always added.</summary>
+        public List<String>     LocalDomains              { get; set; } = [.. Configuration.LocalDomains];
 
         #endregion
 
@@ -85,22 +85,33 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         #region DKIM signing
 
         /// <summary>
-        /// The DKIM d= domain. Follows <see cref="Hostname"/> as long as
-        /// <see cref="Configuration.DkimDomain"/> does and nobody said otherwise,
-        /// so that --hostname alone moves the signing domain along with it.
+        /// The DKIM d= domain: what --dkim-domain or <see cref="Configuration.DkimDomain"/>
+        /// says, and otherwise the first local domain other than localhost -
+        /// the domain the mail is from - or the hostname where there is none.
         /// </summary>
+        /// <remarks>
+        /// Not the hostname first: "--hostname mail.example.org --local-domain
+        /// example.org" sends mail from example.org, and a signature for
+        /// example.org is what DMARC aligns with, strictly as well as relaxed.
+        /// </remarks>
         public String           DkimDomain
         {
 
             get
-                => dkimDomain ?? (Configuration.DkimDomain == Configuration.Hostname
-                                      ? Hostname
-                                      : Configuration.DkimDomain);
+                => dkimDomain ?? Configuration.DkimDomain ?? MailDomain;
 
             set
                 => dkimDomain = value;
 
         }
+
+        /// <summary>
+        /// The first local domain other than localhost, or the hostname.
+        /// </summary>
+        public String           MailDomain
+            => LocalDomains.Select(domain => domain.Trim().TrimEnd('.').ToLowerInvariant()).
+                            FirstOrDefault(domain => domain.Length > 0 && domain is not "localhost" and not "localhost.localdomain")
+               ?? Hostname;
 
         /// <summary>The DKIM s= selector.</summary>
         public String           DkimSelector              { get; set; } = Configuration.DkimSelector;

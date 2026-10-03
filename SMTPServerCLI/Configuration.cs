@@ -107,8 +107,11 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #region Outbound DKIM signing
 
-        /// <summary>DKIM <c>d=</c> domain for outgoing mail. Defaults to the hostname.</summary>
-        public const String    DkimDomain             = Hostname;
+        /// <summary>
+        /// DKIM <c>d=</c> domain for outgoing mail. Null: the first local domain other than localhost -
+        /// the domain the mail is from - and the hostname where there is none.
+        /// </summary>
+        public const String?   DkimDomain             = null;
 
         /// <summary>DKIM selector (<c>s=</c>). The public key must be published at <c>&lt;selector&gt;._domainkey.&lt;domain&gt;</c> — see <c>config/dkim_&lt;selector&gt;.dns.txt</c>.</summary>
         public const String    DkimSelector           = "default";

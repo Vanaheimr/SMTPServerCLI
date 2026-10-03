@@ -69,8 +69,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             yield return "";
 
             yield return "Who it is:";
-            foreach (var line in Switch("--hostname <name>",              $"the public hostname - banner, EHLO, Received headers, and the DKIM " +
-                                                                           $"and report domain unless they are given (default: {Configuration.Hostname})")) yield return line;
+            foreach (var line in Switch("--hostname <name>",              $"the public hostname - banner, EHLO, Received headers, and the domain " +
+                                                                           $"reports are sent from (default: {Configuration.Hostname})")) yield return line;
             foreach (var line in Switch("--local-domain <domain>",         "a domain whose mail is stored here; everything else is relayed, for " +
                                                                            "accounts only. May be given several times and replaces the configured " +
                                                                           $"ones (default: {String.Join(", ", Configuration.LocalDomains)}); localhost is always local")) yield return line;
@@ -91,7 +91,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             yield return "";
 
             yield return "DKIM signing of outgoing mail:";
-            foreach (var line in Switch("--dkim-domain <domain>",          "the d= domain (default: the hostname)")) yield return line;
+            foreach (var line in Switch("--dkim-domain <domain>",          "the d= domain (default: the first local domain other than localhost, " +
+                                                                           "and the hostname where there is none)")) yield return line;
             foreach (var line in Switch("--dkim-selector <selector>",     $"the s= selector; a new one gets a new key pair (default: {Configuration.DkimSelector})")) yield return line;
             yield return "";
 

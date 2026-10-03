@@ -79,12 +79,12 @@ dotnet run --project SMTPServerCLI -- --hostname mail.example.org --local-domain
 
 | Switch | What it does |
 |--------|--------------|
-| `--hostname <name>` | The public hostname, used in the banner, EHLO and `Received` headers. It is also the DKIM and report domain unless those are set separately. Default: `Configuration.Hostname` (`localhost`). |
+| `--hostname <name>` | The public hostname, used in the banner, EHLO and `Received` headers, and the domain reports are sent from. Default: `Configuration.Hostname` (`localhost`). |
 | `--local-domain <domain>` | A domain whose mail is stored here. Mail for any other domain is relayed, for authenticated accounts only. Can be given several times and replaces the configured list. `localhost` is always local. |
 | `--port`, `--submission-port`, `--implicit-tls-port <number>` | The MTA, submission and SMTPS ports. Defaults: 2525 / 2587 / 2465. On the Internet these are 25 / 587 / 465. |
 | `--certificate <file.pfx>`, `--certificate-password <pw>` | Use a real certificate (PKCS#12) instead of the generated self-signed one. |
 | `--require-starttls` | Refuse `MAIL FROM` on the MTA port until STARTTLS has been negotiated. |
-| `--dkim-domain <domain>`, `--dkim-selector <selector>` | The DKIM `d=` and `s=` values. A selector without a key yet gets a newly generated key pair. |
+| `--dkim-domain <domain>`, `--dkim-selector <selector>` | The DKIM `d=` and `s=` values. Without `--dkim-domain` the server signs as the first local domain other than `localhost`, the domain its mail is from, and as the hostname where there is none. A selector without a key yet gets a newly generated key pair. |
 | `--smarthost <host[:port]>`, `--smarthost-user <name>`, `--smarthost-password <pw>` | Relay all outgoing mail through this server instead of each recipient domain's MX. Use this where outbound port 25 is blocked. |
 | `--ssh-port <number>` | The port the command line is served on over SSH. Default: 22525. |
 | `--ssh-any` | Serve SSH on every address instead of the loopback only. |
