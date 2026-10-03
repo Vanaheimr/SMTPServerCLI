@@ -104,6 +104,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         /// <summary>When the server started answering.</summary>
         public DateTimeOffset          StartedAt                { get; private set; }
 
+        /// <summary>The command line over SSH, where it is served.</summary>
+        public SSHService?             SSH                      { get; private set; }
+
         /// <summary>Whether its listeners are still accepting.</summary>
         public Boolean                 IsRunning
             => serverTask is { IsCompleted: false };
@@ -325,6 +328,33 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
             #endregion
 
+            #region The command line over SSH
+
+            if (Settings.SSHEnabled)
+            {
+
+                SSH = new SSHService(this);
+
+                foreach (var (account, file) in Settings.AuthorizeSSHKeys)
+                {
+
+                    if (!File.Exists(file))
+                        throw new InvalidOperationException($"--authorize-ssh-key: there is no file '{file}'.");
+
+                    if (!SSH.Accounts.TryAuthorize(account, await File.ReadAllTextAsync(file), out var added, out var refused))
+                        throw new InvalidOperationException($"--authorize-ssh-key: '{file}' - {refused}");
+
+                    foreach (var fingerprint in added)
+                        Logger.Log(LogLevel.Info, $"'{account}' may sign in to the command line over SSH with the key {fingerprint} now.");
+
+                }
+
+                await SSH.Start();
+
+            }
+
+            #endregion
+
         }
 
         #endregion
@@ -463,6 +493,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         {
 
             await stopping.CancelAsync();
+
+            // The sessions over SSH first, while the server they speak about is still there to say goodbye.
+            if (SSH is not null)
+                await SSH.DisposeAsync();
 
             if (server is not null)
                 await server.DisposeAsync();

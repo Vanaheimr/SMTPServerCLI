@@ -146,7 +146,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
                     File.Delete(file);
 
-                    server.Logger.Log(LogLevel.Info, $"Deleted the message {Path.GetFileName(file)} at the command line.");
+                    server.Logger.Log(LogLevel.Info, $"{cli.Who} deleted the message {Path.GetFileName(file)}.");
 
                     return [ $"Deleted {Path.GetFileName(file)}." ];
 

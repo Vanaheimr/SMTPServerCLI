@@ -43,6 +43,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             "[--certificate <file.pfx>]", "[--certificate-password <pw>]", "[--require-starttls]",
             "[--dkim-domain <domain>]", "[--dkim-selector <selector>]",
             "[--smarthost <host[:port]>]", "[--smarthost-user <name>]", "[--smarthost-password <pw>]",
+            "[--ssh-port <number>]", "[--ssh-any]", "[--no-ssh]", "[--authorize-ssh-key <account>=<file.pub>]...",
             "[--config <dir>]", "[--mailstore <dir>]",
             "[--verbose | --quiet | --log-level <level>]", "[--version]"
         ];
@@ -100,6 +101,16 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                                                                            "home and cloud connections. Port 25 unless given")) yield return line;
             foreach (var line in Switch("--smarthost-user <name>",         "authenticate at the smarthost as this account")) yield return line;
             foreach (var line in Switch("--smarthost-password <pw>",       "with this password")) yield return line;
+            yield return "";
+
+            yield return "The command line over SSH - keys only, accounts of their own, not the SMTP ones:";
+            foreach (var line in Switch("--ssh-port <number>",          $"the port it is served on (default: {Configuration.SSHPort})")) yield return line;
+            foreach (var line in Switch("--ssh-any",                     "every address rather than the loopback only")) yield return line;
+            foreach (var line in Switch("--no-ssh",                      "do not serve it over SSH")) yield return line;
+            foreach (var line in Switch("--authorize-ssh-key <account>=<file.pub>",
+                                                                         "let the account in with the public key in the file - an OpenSSH .pub, " +
+                                                                         "or what PuTTYgen saves - kept in config/ssh/authorized/<account>, in the format " +
+                                                                         "of OpenSSH's authorized_keys. May be given several times")) yield return line;
             yield return "";
 
             yield return "Files:";

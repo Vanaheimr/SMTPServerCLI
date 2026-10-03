@@ -51,6 +51,20 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #endregion
 
+        #region The command line over SSH
+
+        /// <summary>
+        /// Serve the command line over SSH as well - the way to reach it on a server started by
+        /// systemd, which has no console to type at. Only accounts with a key in config/ssh/authorized/
+        /// get in; with none, it listens and lets nobody in.
+        /// </summary>
+        public const Boolean   EnableSSH              = true;
+
+        /// <summary>The SSH port of the command line. On the loopback only, unless --ssh-any.</summary>
+        public const UInt16    SSHPort                = 22525;
+
+        #endregion
+
         #region Local delivery & relay
 
         /// <summary>

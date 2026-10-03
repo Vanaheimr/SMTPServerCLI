@@ -222,7 +222,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
                     await server.MailQueue.RemoveAsync(id, CancellationToken);
 
-                    server.Logger.Log(LogLevel.Info, $"Removed {id} from the outbound queue at the command line.");
+                    server.Logger.Log(LogLevel.Info, $"{cli.Who} removed {id} from the outbound queue.");
 
                     return [ $"Removed {id}. Nobody is told: no bounce goes back to the sender." ];
 

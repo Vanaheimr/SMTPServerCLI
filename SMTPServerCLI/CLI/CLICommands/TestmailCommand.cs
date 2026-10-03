@@ -106,6 +106,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
             var ids = await server.MailSender.SendAsync((EMail) mail, CancellationToken);
 
+            server.Logger.Log(LogLevel.Info, $"{cli.Who} queued a test message from {from} to {to}.");
+
             return [ $"Queued as {String.Join(", ", ids)}: from {from} to {to}" +
                      (settings.SmartHost is not null ? $" via {settings.SmartHost}." : $", to the MX of {to.Domain}.") +
                       " The log says how the delivery goes; 'queue' shows it while it waits." ];

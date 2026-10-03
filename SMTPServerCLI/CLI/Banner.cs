@@ -72,6 +72,17 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             foreach (var (label, value) in Server.Listeners())
                 Add(label, value);
 
+            if (Server.SSH is SSHService ssh)
+            {
+                var keyed = ssh.Accounts.AccountsWithKeys();
+                Add("SSH",         $"{ssh.URL} - the command line\n{ssh.HostKey}\n" +
+                                   (keyed.Count == 0
+                                        ? "no account has a key yet: --authorize-ssh-key <account>=<file.pub>"
+                                        : $"accounts with a key: {String.Join(", ", keyed)}"));
+            }
+            else
+                Add("SSH",         "off");
+
             Add("built from",      String.Join("\n", SMTPServerInstance.BuiltFrom()));
 
             Add("hostname",        settings.Hostname);

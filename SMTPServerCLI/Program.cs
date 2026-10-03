@@ -85,8 +85,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
                     SocketException { SocketErrorCode: SocketError.AddressAlreadyInUse }
                         => $"The SMTP server could not start: one of its ports - {settings.Port}, {settings.SubmissionPort}, " +
-                           $"{settings.ImplicitTlsPort} - is in use already. Another instance? --port, --submission-port " +
-                            "and --implicit-tls-port choose others.",
+                           $"{settings.ImplicitTlsPort}{(settings.SSHEnabled ? $", SSH {settings.SSHPort}" : "")} - is in use already. " +
+                            "Another instance? --port, --submission-port, --implicit-tls-port and --ssh-port choose others.",
 
                     SocketException { SocketErrorCode: SocketError.AccessDenied }
                         => $"The SMTP server could not start: it may not bind one of its ports - {settings.Port}, " +
@@ -284,6 +284,36 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
                     #endregion
 
+                    #region The command line over SSH
+
+                    case "--ssh-port":
+                        if (Port(Arguments, ref i, flag) is not UInt16 sshPort)
+                            return 2;
+                        Settings.SSHPort = sshPort;
+                        break;
+
+                    case "--ssh-any":
+                        Settings.SSHAnyAddress = true;
+                        break;
+
+                    case "--no-ssh":
+                        Settings.SSHEnabled = false;
+                        break;
+
+                    case "--authorize-ssh-key":
+                        if (Value(Arguments, ref i, flag, "<account>=<file.pub>") is not String authorize)
+                            return 2;
+                        var equals = authorize.IndexOf('=');
+                        if (equals <= 0 || equals == authorize.Length - 1 || !SSHAccounts.IsAccountName(authorize[..equals]))
+                        {
+                            Usage.Say(Console.Error, $"{flag} wants <account>=<file.pub>, an account name being letters, digits, '.', '-' and '_'; got '{authorize}'.");
+                            return 2;
+                        }
+                        Settings.AuthorizeSSHKeys.Add((authorize[..equals], authorize[(equals + 1)..]));
+                        break;
+
+                    #endregion
+
                     #region Files
 
                     case "--config":
@@ -341,11 +371,13 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                 return 2;
             }
 
-            var ports = new[] { Settings.Port, Settings.SubmissionPort, Settings.ImplicitTlsPort };
+            UInt16[] ports = Settings.SSHEnabled
+                                 ? [ Settings.Port, Settings.SubmissionPort, Settings.ImplicitTlsPort, Settings.SSHPort ]
+                                 : [ Settings.Port, Settings.SubmissionPort, Settings.ImplicitTlsPort ];
 
             if (ports.Distinct().Count() < ports.Length)
             {
-                Usage.Say(Console.Error, $"The MTA, submission and implicit-TLS ports have to differ: {String.Join(", ", ports)}.");
+                Usage.Say(Console.Error, $"The MTA, submission, implicit-TLS and SSH ports have to differ: {String.Join(", ", ports)}.");
                 return 2;
             }
 

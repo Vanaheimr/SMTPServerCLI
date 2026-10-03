@@ -130,6 +130,22 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #endregion
 
+        #region The command line over SSH
+
+        /// <summary>Whether the command line is served over SSH.</summary>
+        public Boolean          SSHEnabled                { get; set; } = Configuration.EnableSSH;
+
+        /// <summary>The port it is served on.</summary>
+        public UInt16           SSHPort                   { get; set; } = Configuration.SSHPort;
+
+        /// <summary>Every address rather than the loopback only.</summary>
+        public Boolean          SSHAnyAddress             { get; set; }
+
+        /// <summary>Keys to let in before the start: an account and a file with its public key(s).</summary>
+        public List<(String Account, String File)>  AuthorizeSSHKeys  { get; } = [];
+
+        #endregion
+
         #region Console
 
         /// <summary>From which level up the log is written to the console; null for none of it.</summary>

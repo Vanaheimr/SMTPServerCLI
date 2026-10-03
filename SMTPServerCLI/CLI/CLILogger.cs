@@ -17,6 +17,8 @@
 
 #region Usings
 
+using System.Collections.Concurrent;
+
 using org.GraphDefined.Vanaheimr.Illias;
 
 #endregion
@@ -41,6 +43,10 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
     /// One entry is one line: a message with line breaks of its own would
     /// otherwise continue on lines with no time and no level.
     /// </para>
+    /// <para>
+    /// Every command line over SSH gets the log as well, as a listener with a
+    /// level of its own - see <see cref="Listen"/>.
+    /// </para>
     /// </remarks>
     /// <param name="MinimumLevel">From which level up to write; null for nothing.</param>
     public sealed class CLILogger(LogLevel? MinimumLevel) : ILogger
@@ -48,8 +54,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #region Data
 
-        private readonly  Lock            padlock  = new();
-        private           Action<Action>? shareConsole;
+        private readonly  Lock                                     padlock    = new();
+        private           Action<Action>?                          shareConsole;
+        private readonly  ConcurrentDictionary<LogListener, Byte>  listeners  = new();
 
         #endregion
 
@@ -77,33 +84,77 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         #endregion
 
+        #region Listen(MinimumLevel, Write)
+
+        /// <summary>
+        /// Hand every entry from the given level up to the given writer as well,
+        /// until the listener that comes back is disposed of.
+        /// </summary>
+        /// <param name="MinimumLevel">From which level up; null for nothing, until it is changed.</param>
+        /// <param name="Write">What writes an entry: its level, its line and the colour it is shown in. It must not block.</param>
+        public LogListener Listen(LogLevel?                               MinimumLevel,
+                                  Action<LogLevel, String, ConsoleColor?>  Write)
+        {
+
+            var listener = new LogListener(MinimumLevel, Write, this);
+
+            listeners.TryAdd(listener, 0);
+
+            return listener;
+
+        }
+
+        internal void Forget(LogListener Listener)
+
+            => listeners.TryRemove(Listener, out _);
+
+        #endregion
+
         #region Log(Level, Message)
 
         public void Log(LogLevel  Level,
                         String    Message)
         {
 
-            if (MinimumLevel is not LogLevel minimum || Level < minimum)
+            var toConsole  = MinimumLevel is LogLevel minimum && Level >= minimum;
+            var toAnybody  = toConsole || listeners.Keys.Any(listener => listener.MinimumLevel is LogLevel level && Level >= level);
+
+            if (!toAnybody)
                 return;
 
-            var line = $"{Timestamp.Now.ToLocalTime():HH:mm:ss.fff} {Prefix(Level)} {Message.ReplaceLineEndings(" ")}";
+            var line   = $"{Timestamp.Now.ToLocalTime():HH:mm:ss.fff} {Prefix(Level)} {Message.ReplaceLineEndings(" ")}";
+            var color  = Color(Level);
 
-            (shareConsole ?? WriteLocked)(() => {
+            if (toConsole)
+                (shareConsole ?? WriteLocked)(() => {
 
-                var color = Console.ForegroundColor;
+                    var previous = Console.ForegroundColor;
 
-                Console.ForegroundColor = Level switch {
-                                              LogLevel.Debug    => ConsoleColor.DarkGray,
-                                              LogLevel.Warning  => ConsoleColor.Yellow,
-                                              LogLevel.Error    => ConsoleColor.Red,
-                                              _                 => color
-                                          };
+                    if (color is ConsoleColor shown)
+                        Console.ForegroundColor = shown;
 
-                Console.WriteLine(line);
+                    Console.WriteLine(line);
 
-                Console.ForegroundColor = color;
+                    Console.ForegroundColor = previous;
 
-            });
+                });
+
+            foreach (var listener in listeners.Keys)
+            {
+
+                if (listener.MinimumLevel is not LogLevel level || Level < level)
+                    continue;
+
+                try
+                {
+                    listener.Write(Level, line, color);
+                }
+                catch
+                {
+                    // A session that is going away; the log goes on without it.
+                }
+
+            }
 
         }
 
@@ -118,6 +169,15 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         public static String Name(LogLevel? Level)
 
             => Level?.ToString().ToLowerInvariant() ?? "off";
+
+        private static ConsoleColor? Color(LogLevel Level)
+
+            => Level switch {
+                   LogLevel.Debug    => ConsoleColor.DarkGray,
+                   LogLevel.Warning  => ConsoleColor.Yellow,
+                   LogLevel.Error    => ConsoleColor.Red,
+                   _                 => null
+               };
 
         private static String Prefix(LogLevel Level)
 
@@ -171,6 +231,49 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         }
 
         #endregion
+
+    }
+
+}
+
+
+namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
+{
+
+    /// <summary>
+    /// One more place the log is written to - a command line over SSH - with
+    /// a level of its own, until it is disposed of.
+    /// </summary>
+    public sealed class LogListener : IDisposable
+    {
+
+        private readonly CLILogger logger;
+
+        /// <summary>
+        /// From which level up the log is written here; null for nothing.
+        /// </summary>
+        public LogLevel?                                MinimumLevel    { get; set; }
+
+        /// <summary>
+        /// What writes an entry.
+        /// </summary>
+        public Action<LogLevel, String, ConsoleColor?>  Write           { get; }
+
+        internal LogListener(LogLevel?                                MinimumLevel,
+                             Action<LogLevel, String, ConsoleColor?>  Write,
+                             CLILogger                                Logger)
+        {
+            this.MinimumLevel  = MinimumLevel;
+            this.Write         = Write;
+            this.logger        = Logger;
+        }
+
+        /// <summary>
+        /// Stop writing the log here.
+        /// </summary>
+        public void Dispose()
+
+            => logger.Forget(this);
 
     }
 

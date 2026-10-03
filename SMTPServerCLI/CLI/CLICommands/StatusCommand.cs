@@ -73,6 +73,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                                  $"{QueueCommand.Count(server, QueueCommand.Delivered)} delivered",
                 $"  mailbox        {MailboxCommand.Messages(server).Count()} message(s) in {server.Settings.MailStoragePath}",
                 $"  accounts       {(accounts.Count > 0 ? String.Join(", ", accounts.Select(account => account.Name)) : "none - nobody can relay")}",
+                $"  SSH            {(server.SSH is SSHService ssh ? $"{ssh.Sessions.Count} session(s) on {ssh.URL} - 'who' lists them" : "off")}",
                 $"  console log    from {CLILogger.Name(server.Logger.MinimumLevel)} up"
             ]);
 

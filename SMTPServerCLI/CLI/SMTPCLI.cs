@@ -53,7 +53,32 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         /// <summary>
         /// The server these commands are about.
         /// </summary>
-        public SMTPServerInstance  Server    { get; }
+        public SMTPServerInstance  Server        { get; }
+
+        /// <summary>
+        /// The account signed in over SSH; null at the console.
+        /// </summary>
+        public String?             Account       { get; }
+
+        /// <summary>
+        /// Where the account signed in from; null at the console.
+        /// </summary>
+        public String?             From          { get; }
+
+        /// <summary>
+        /// The log as this command line shows it, where it is a session over SSH;
+        /// null at the console, whose log is the server's console log.
+        /// </summary>
+        public LogListener?        SessionLog    { get; set; }
+
+        /// <summary>
+        /// Who is typing here, as the log names it: "the console", or the
+        /// account and where it signed in from.
+        /// </summary>
+        public String              Who
+            => Account is null
+                   ? "the console"
+                   : $"'{Account}' over SSH from {From}";
 
         #endregion
 
@@ -72,6 +97,34 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
         {
 
             this.Server = Server;
+
+            RegisterCLIType(typeof(SMTPCLI));
+
+        }
+
+        /// <summary>
+        /// The command line of the given server on the given terminal, for an
+        /// account signed in over SSH. 'quit' leaves the session; the server
+        /// keeps running.
+        /// </summary>
+        /// <param name="Server">The running server.</param>
+        /// <param name="Terminal">What the command line is typed at and written on.</param>
+        /// <param name="Account">The account signed in.</param>
+        /// <param name="From">Where it signed in from.</param>
+        /// <param name="AssembliesWithCLICommands">Further assemblies to search for commands.</param>
+        public SMTPCLI(SMTPServerInstance  Server,
+                       ICLITerminal        Terminal,
+                       String              Account,
+                       String              From,
+                       params Assembly[]   AssembliesWithCLICommands)
+
+            : base(Terminal, AssembliesWithCLICommands)
+
+        {
+
+            this.Server   = Server;
+            this.Account  = Account;
+            this.From     = From;
 
             RegisterCLIType(typeof(SMTPCLI));
 

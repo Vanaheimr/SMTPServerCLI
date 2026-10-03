@@ -132,8 +132,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                         return [ refused ];
 
                     cli.Server.Logger.Log(LogLevel.Info, what == "add"
-                                                             ? $"Added the account '{name}' at the command line."
-                                                             : $"Gave the account '{name}' a new password at the command line.");
+                                                             ? $"{cli.Who} added the account '{name}'."
+                                                             : $"{cli.Who} gave the account '{name}' a new password.");
 
                     return madeUp
                                ? [ $"'{name}' has the password '{password}' now - shown this once." ]
@@ -147,7 +147,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                     if (!users.Remove(Arguments[2]))
                         return [ $"There is no account '{Arguments[2]}'." ];
 
-                    cli.Server.Logger.Log(LogLevel.Info, $"Removed the account '{Arguments[2]}' at the command line.");
+                    cli.Server.Logger.Log(LogLevel.Info, $"{cli.Who} removed the account '{Arguments[2]}'.");
 
                     return [ $"Removed '{Arguments[2]}'. A session it is signed in to right now stays signed in until it ends." ];
 

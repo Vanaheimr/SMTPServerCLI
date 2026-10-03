@@ -30,7 +30,8 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
     /// </summary>
     /// <remarks>
     /// --verbose and --quiet say it at the start; this changes it while the
-    /// server runs - debug while chasing a delivery, off to type in peace.
+    /// server runs - debug while chasing a delivery, off to type in peace. A
+    /// session over SSH has a log of its own and changes only that.
     /// </remarks>
     /// <param name="CLI">The command line.</param>
     public class LogCommand(SMTPCLI CLI) : ACLICommand<SMTPCLI>(CLI),
@@ -71,20 +72,23 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                                                CancellationToken  CancellationToken)
         {
 
-            var logger = cli.Server.Logger;
+            var where = cli.SessionLog is not null ? "This session" : "The console";
 
             if (Arguments.Length > 2)
                 return Task.FromResult<String[]>([ $"Usage: {Help()}" ]);
 
             if (Arguments.Length == 1)
-                return Task.FromResult<String[]>([ Shows(logger.MinimumLevel, "") ]);
+                return Task.FromResult<String[]>([ Shows(where, cli.SessionLog is { } shown ? shown.MinimumLevel : cli.Server.Logger.MinimumLevel, "") ]);
 
             if (!CLILogger.TryParse(Arguments[1], out var level))
                 return Task.FromResult<String[]>([ $"'{Arguments[1]}' is no level. Use one of {String.Join(", ", CLILogger.Levels)}." ]);
 
-            logger.MinimumLevel = level;
+            if (cli.SessionLog is { } sessionLog)
+                sessionLog.MinimumLevel = level;
+            else
+                cli.Server.Logger.MinimumLevel = level;
 
-            return Task.FromResult<String[]>([ Shows(level, " now") ]);
+            return Task.FromResult<String[]>([ Shows(where, level, " now") ]);
 
         }
 
@@ -94,18 +98,18 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
 
         public override String Help()
 
-            => $"{CommandName} [{String.Join("|", CLILogger.Levels)}] - how much of the log the console shows";
+            => $"{CommandName} [{String.Join("|", CLILogger.Levels)}] - how much of the log this console or session shows";
 
         #endregion
 
 
-        #region (private static) Shows(Level, Now)
+        #region (private static) Shows(Where, Level, Now)
 
-        private static String Shows(LogLevel? Level, String Now)
+        private static String Shows(String Where, LogLevel? Level, String Now)
 
             => Level is LogLevel shown
-                   ? $"The console shows the log from {CLILogger.Name(shown)} up{Now}."
-                   : $"The console shows no log{Now}.";
+                   ? $"{Where} shows the log from {CLILogger.Name(shown)} up{Now}."
+                   : $"{Where} shows no log{Now}.";
 
         #endregion
 
