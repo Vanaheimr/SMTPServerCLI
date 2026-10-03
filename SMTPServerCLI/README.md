@@ -1,94 +1,204 @@
-# Hermod SMTP Server — CLI
+# SMTPServerCLI
 
 A **ready-to-run, self-contained SMTP server** built on the
-[Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) mail stack. This project is the thin runnable
-*instance* — wiring, configuration, and crypto material — meant to be deployed on a real server
-straight from this git repository. The protocol engine (ESMTP, STARTTLS, SASL, SPF/DKIM/DMARC/ARC,
-MTA-STS/DANE/TLS-RPT, DSN/MDN, OpenPGP) lives in Hermod and is documented there:
+[Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) mail stack, with a
+command line to run it from. This project is the thin runnable *instance*: the
+wiring, the defaults, the crypto material and the prompt. It is meant to be
+deployed on a real server straight from this git repository. The protocol engine
+lives in Hermod and is documented there and in this repository:
 
-- **[SMTP_SUPPORT.md](../../libs/Hermod/SMTP_SUPPORT.md)** — the per-RFC support reference (what is
-  implemented and how it was validated).
-- **[docs/SMTP-Server.md](../../docs/SMTP-Server.md)** — the operational guide (architecture, the
-  full configuration reference, the **DNS setup guide**, deployment, and API examples).
+- **[`libs/Hermod/Hermod/SMTP/README.md`](../libs/Hermod/Hermod/SMTP/README.md)**:
+  the per-RFC support reference. It says what is implemented and how it was
+  validated.
+- **[`README.md`](../README.md)** at the root of this repository: the
+  operational guide. It covers the architecture, the configuration, the
+  **DNS setup guide**, deployment, API examples and the known limitations.
 
-This README only covers what is specific to *this* CLI project.
+This README covers only what is specific to the CLI.
 
 ## Design: everything in the repository, nothing in the environment
 
-The guiding principle is **no fiddling with environment variables on the host**. Everything the
-server needs lives in the repository:
-
-- **Configuration is code.** All settings — hostname, ports, local domains, DKIM domain/selector,
-  verification and reporting flags, smarthost, rate limits — are strongly-typed constants in
-  [`Configuration.cs`](Configuration.cs). To reconfigure, edit that file and rebuild. There are **no**
-  environment variables to set.
-- **Crypto is generated into the repo.** On first run the server writes a self-signed TLS certificate
-  and a DKIM key pair into the git-tracked [`config/`](config/) folder. You can then commit them so a
-  fresh clone keeps the same DKIM key (and its published DNS record stays valid). See
+- **Defaults are code.** Every setting is a strongly-typed constant in
+  [`Configuration.cs`](Configuration.cs). This includes the hostname, ports,
+  local domains, DKIM domain and selector, reporting flags, smarthost, rate
+  limits and queue tuning. To change a default for good, edit that file and
+  rebuild. There are **no** environment variables to set.
+- **Switches change one start.** The settings that are commonly changed for a
+  single run have a switch: identity, ports, certificate, DKIM, smarthost,
+  folders and the console log. A switch overrides the default for that start and
+  is written nowhere. `-h` lists them.
+- **Crypto is generated into the repo.** On the first start the server writes a
+  self-signed TLS certificate and a DKIM key pair into the git-tracked
+  [`config/`](config/) folder. You can commit them, so that a fresh clone keeps
+  the same DKIM key and its published DNS record stays valid. See
   [`config/README.md`](config/README.md).
 
-## Quick start
+## Getting it
 
 ```sh
-git submodule update --init --depth 1 libs/Hermod libs/Styx
-cd SMTPServerCLI/SMTPServerCLI
-dotnet run
+git clone --recurse-submodules git@github.com:Vanaheimr/SMTPServerCLI.git
 ```
 
-On first run it generates `config/server.pfx` and `config/dkim_default.*`, prints the effective
-configuration, and starts listening. The default ports are the non-privileged **2525 / 2587 / 2465**,
-so it runs anywhere without root.
+In an existing clone without the libraries:
 
-> The `config/` and `mailstore/` folders are resolved relative to the **current working directory**,
-> so run from the project directory (as above) in development, or from the published folder in
-> production — the crypto and data folders sit next to the app in both cases.
+```sh
+git submodule update --init --recursive
+```
 
-## Configuration
+You need the .NET 10 SDK.
 
-Open [`Configuration.cs`](Configuration.cs) — it is the single source of truth, grouped and commented:
+## Building and running
 
-| Setting | Default | Notes |
-|---------|---------|-------|
-| `Hostname` | `localhost` | Banner / EHLO / Received / default DKIM & report domain |
-| `Port` / `SubmissionPort` / `ImplicitTlsPort` | `2525` / `2587` / `2465` | **Production: 25 / 587 / 465** (needs privileges — see below) |
-| `LocalDomains` | `["localhost"]` | Mail to these is delivered locally; everything else is authenticated relay |
-| `RequireAuthForRelay` | `true` | **Keep true** — prevents an open relay |
-| `VerifyDkim` / `VerifySpf` / `VerifyDmarc` | `true` | Inbound authentication checks |
-| `DkimDomain` / `DkimSelector` | `Hostname` / `default` | Outbound DKIM signing (key auto-generated) |
-| `CertificatePassword` | `smtp-test-password` | Protects `config/server.pfx` |
-| `SmartHost*` | `null` | Optional relay host; null = direct-to-MX |
-| `EnableDane` / `EnableTlsRpt*` / `EnableDmarcReporting` / `EnableAutoMdn` | `false` | Opt-in features |
-| Rate limits, queue concurrency, session timeout | see file | Operational tuning |
+From the repository root:
+
+```sh
+dotnet run --project SMTPServerCLI
+```
+
+Or build once with `./updateAndBuild.sh` and then start with `./run.sh`. Both
+scripts accept the same switches.
+
+On the first start the server generates `config/server.pfx` and
+`config/dkim_default.*`. It also creates one account, `admin`, with a random
+password. Then it prints the banner and starts listening. The banner shows where
+the server answers, the commit each assembly was built from, its folders,
+certificate, DKIM selector and outbound route. A box below the banner lists what
+needs attention before the server is exposed to the Internet, including the
+`admin` password. That password is shown **this once**.
+
+The default ports are the non-privileged **2525 / 2587 / 2465**, so the server
+runs anywhere without root.
+
+A typical start for a real domain:
+
+```sh
+dotnet run --project SMTPServerCLI -- --hostname mail.example.org --local-domain example.org
+```
+
+### Switches
+
+| Switch | What it does |
+|--------|--------------|
+| `--hostname <name>` | The public hostname, used in the banner, EHLO and `Received` headers. It is also the DKIM and report domain unless those are set separately. Default: `Configuration.Hostname` (`localhost`). |
+| `--local-domain <domain>` | A domain whose mail is stored here. Mail for any other domain is relayed, for authenticated accounts only. Can be given several times and replaces the configured list. `localhost` is always local. |
+| `--port`, `--submission-port`, `--implicit-tls-port <number>` | The MTA, submission and SMTPS ports. Defaults: 2525 / 2587 / 2465. On the Internet these are 25 / 587 / 465. |
+| `--certificate <file.pfx>`, `--certificate-password <pw>` | Use a real certificate (PKCS#12) instead of the generated self-signed one. |
+| `--require-starttls` | Refuse `MAIL FROM` on the MTA port until STARTTLS has been negotiated. |
+| `--dkim-domain <domain>`, `--dkim-selector <selector>` | The DKIM `d=` and `s=` values. A selector without a key yet gets a newly generated key pair. |
+| `--smarthost <host[:port]>`, `--smarthost-user <name>`, `--smarthost-password <pw>` | Relay all outgoing mail through this server instead of each recipient domain's MX. Use this where outbound port 25 is blocked. |
+| `--config <dir>`, `--mailstore <dir>` | Override where the crypto material and the runtime data live. |
+| `--verbose`, `--quiet`, `--log-level <level>` | How much of the log the console shows: `debug`, `info` (the default), `warning`, `error` or `off`. |
+| `--version` | Print the commit each assembly was built from, then exit. |
+
+Exit codes: 0 after a requested stop, 1 when the server could not start (for
+example, a port is already in use), 2 when the switches were invalid.
+
+## Typing at it
+
+Once the server is up, the console shows a prompt (`smtp@<hostname>> `). The
+log scrolls past above the prompt without breaking the line being typed.
+
+- **Tab** completes commands and their arguments: subcommands, account names,
+  queue ids and stored messages.
+- **Up/Down** step through the history.
+- `quit`, **Ctrl+C** or a service manager's SIGTERM stop the server. Ctrl+C
+  also cancels a command that is still running.
+
+The server stops accepting connections, lets running sessions finish and leaves
+the outbound queue on disk for the next start.
+
+| Command | What it does |
+|---------|--------------|
+| `help` | Lists the commands. |
+| `status` | Shows uptime, the outbound queue (pending / deferred / in delivery / failed / delivered), the number of stored messages, the accounts and the log level. |
+| `config` | Prints the banner again: ports, build, folders, certificate, DKIM, outbound route and reporting. |
+| `user [list]` | Lists the accounts and the SASL mechanisms each can use. Accounts with a well-known password are flagged. |
+| `user add <name> [<password>]` | Adds an account. Without a password, one is generated and shown once. |
+| `user passwd <name> [<password>]` | Gives an account a new password. Without a password, one is generated and shown once. |
+| `user remove <name>` | Removes an account. |
+| `queue [list]` | Lists what waits to go out, including deferred mail, with its next attempt and last error. |
+| `queue failed` | Lists what gave up (the newest 50). |
+| `queue show <id>` | Shows one queue entry in full: envelope, subject, attempts, remote MX and its last answer. Tab completes the id, and a unique prefix is enough. |
+| `queue flush` | Retries everything that is deferred, now. |
+| `queue remove <id>` | Drops a pending entry. No bounce is sent. |
+| `mailbox [list [<count>]]` | Shows the newest received messages (default 20). Each line has the envelope, subject and the SPF/DKIM/DMARC results. |
+| `mailbox show <message>` | Prints a stored message (up to 200 lines). |
+| `mailbox delete <message>` | Deletes a stored message. |
+| `dns [records]` | Prints the DNS records this server needs: MX, A/AAAA, PTR, SPF, DKIM, DMARC, TLS-RPT, and DANE/TLSA when the certificate is a real one. The DKIM record is computed from the key the server actually signs with and is split into 255-character strings. |
+| `dns check` | Looks those records up through the server's own resolver and reports which are missing. It also checks whether the published DKIM key matches the server's key. |
+| `testmail <to> [<from>]` | Queues a short DKIM-signed test message to an external address. Read SPF, DKIM and DMARC from the recipient's "show original". |
+| `log [debug\|info\|warning\|error\|off]` | Shows or changes how much of the log the console shows. |
+| `history`, `quit` / `exit` | From Styx's command line. |
+
+When the server runs under systemd, from a script, or with its output
+redirected, there is no prompt. It simply runs until SIGTERM, and the console
+shows only the log.
+
+### Adding a command
+
+A command is one file in [`CLI/CLICommands/`](CLI/CLICommands/), and nothing
+needs to be registered. Any class in this assembly that implements Styx's
+`ICLICommand` and has a constructor taking an `SMTPCLI` is found and registered
+automatically. Through `cli.Server` (an [`SMTPServerInstance`](SMTPServerInstance.cs))
+a command can reach the settings, the queue, the accounts, the DNS client and the
+log. [`LogCommand.cs`](CLI/CLICommands/LogCommand.cs) is the smallest example.
 
 ## Folders
 
+When run from a checkout, both folders are next to this project, regardless of
+the directory you start from. A published server uses the current directory
+instead. `--config` and `--mailstore` override either location.
+
 | Folder | Contents | Committed? |
 |--------|----------|------------|
-| [`config/`](config/) | TLS certificate + DKIM keys (generated on first run) | tracked — commit the keys when you want them stable |
-| `mailstore/` | Received `.eml`, the outbound queue, `users.txt`, reporting state | **git-ignored** (runtime data, contains credential hashes) |
+| [`config/`](config/) | TLS certificate and DKIM keys, generated on the first start. | Tracked. Commit the keys if you want them to stay stable. |
+| `mailstore/` | Received `.eml` files, the outbound queue (`queue/pending`, `queue/failed`, `queue/delivered`), `users.txt` and the reporting state. | **Git-ignored**: runtime data, including credential hashes. |
 
 ## User accounts
 
-Accounts live in `mailstore/users.txt` (SHA-256 password hashes + SCRAM credentials + optional client-
-certificate thumbprints for SASL `EXTERNAL`). On first run three demo users are created —
-`admin` / `test123`, `user` / `test123`, `demo` / `demo`. **Change them before any real use.**
+Accounts live in `mailstore/users.txt`. Each line has a SHA-256 password hash
+for PLAIN/LOGIN, SCRAM-SHA-256 credentials, and optional client-certificate
+thumbprints for SASL `EXTERNAL`. The server re-reads the file whenever it
+changes, so the `user` command takes effect at the next AUTH without a restart.
+
+On the first start the CLI writes the file itself, with the single account
+`admin` and a random password. Without this step, Hermod would create its demo
+accounts (`admin` / `user` = `test123`, `demo` = `demo`), whose passwords are
+published. An existing file is left alone, but accounts that still have one of
+those passwords are flagged in the banner and by `user list`.
+
+A client certificate authenticates an account only if its **thumbprint** is
+listed for that account. Hermod's own store would also accept any certificate
+whose common name matches the account name, so the CLI replaces that lookup with
+[`PinnedCertificateUserStore`](PinnedCertificateUserStore.cs). (`AUTH EXTERNAL`
+is currently unreachable anyway, because the server does not request a client
+certificate. See the limitations in the [operational guide](../README.md#production-readiness--limitations).)
+
+Generated passwords are the safer choice. A password typed after `user add` or
+`user passwd` stays in the command line's history until the server stops.
 
 ## Running on a real Internet server
 
-1. **Set your identity.** In `Configuration.cs`: `Hostname = "mail.example.com"`,
-   `LocalDomains = ["example.com"]`, `DkimDomain = "example.com"`, and the standard ports
-   `Port = 25`, `SubmissionPort = 587`, `ImplicitTlsPort = 465`. Rebuild.
-2. **Bind privileged ports.** 25/587/465 need elevated privileges — either run with a capability
-   (`sudo setcap 'cap_net_bind_service=+ep' $(which dotnet)` or on the published binary) or put a
-   port-forward in front.
-3. **Use a real TLS certificate.** Replace the self-signed `config/server.pfx` with a real certificate
-   for the MX hostname (e.g. Let's Encrypt, exported as PKCS#12 with `CertificatePassword`).
-4. **Publish DNS.** MX, SPF, the DKIM record from `config/dkim_<selector>.dns.txt`, DMARC, and
-   (optionally) MTA-STS / TLS-RPT / DANE — the full record set and verification commands are in the
-   [DNS setup guide](../../docs/SMTP-Server.md#dns-setup-guide).
-5. **Static IP with matching PTR** (FCrDNS), open the firewall for 25/587/465 inbound and 25 outbound
-   (or configure a `SmartHost`), and don't be on a blocklist.
-6. **Run as a service** (systemd example):
+1. **Set its identity.** Either start with `--hostname mail.example.com
+   --local-domain example.com --port 25 --submission-port 587
+   --implicit-tls-port 465`, or set the same values in `Configuration.cs` and
+   rebuild.
+2. **Bind the privileged ports.** Ports 25, 587 and 465 need elevated
+   privileges. Either give the binary a capability (`AmbientCapabilities=` in
+   the unit below, or `setcap 'cap_net_bind_service=+ep'` on the published
+   binary), or put a port-forward in front of the default ports.
+3. **Use a real TLS certificate** for the MX hostname, for example from Let's
+   Encrypt, exported as PKCS#12. Pass it with `--certificate` and
+   `--certificate-password`, or replace `config/server.pfx`.
+4. **Publish DNS.** `dns` prints the records for this server, and `dns check`
+   confirms they are published. The background on each record is in the
+   [DNS setup guide](../README.md#dns-setup-guide).
+5. **Use a static IP with a matching PTR** (FCrDNS). Open the firewall for ports
+   25/587/465 inbound and 25 outbound, or use `--smarthost`. Make sure the IP is
+   not on a blocklist.
+6. **Test it.** Send a message with `testmail you@gmail.com` and check
+   *Show original*.
+7. **Run it as a service** (systemd example):
 
    ```ini
    [Unit]
@@ -97,7 +207,7 @@ certificate thumbprints for SASL `EXTERNAL`). On first run three demo users are 
 
    [Service]
    WorkingDirectory=/opt/hermod-smtp        # config/ and mailstore/ live here
-   ExecStart=/usr/bin/dotnet /opt/hermod-smtp/SMTPServerCLI.dll
+   ExecStart=/usr/bin/dotnet /opt/hermod-smtp/SMTPServerCLI.dll --hostname mail.example.com --local-domain example.com --port 25 --submission-port 587 --implicit-tls-port 465
    Restart=on-failure
    AmbientCapabilities=CAP_NET_BIND_SERVICE  # to bind 25/587/465
 
@@ -105,13 +215,18 @@ certificate thumbprints for SASL `EXTERNAL`). On first run three demo users are 
    WantedBy=multi-user.target
    ```
 
+   Under systemd there is no prompt. The server logs to the journal and stops
+   on SIGTERM.
+
 ## Status
 
-This is an RFC-conformant reference implementation, **not** a hardened production MX: there is no
-anti-spam/abuse layer, recipients are accepted catch-all, and the code has not been security-audited.
-Read the [production-readiness section](../../docs/SMTP-Server.md#production-readiness--limitations)
-before exposing it to untrusted mail.
+This is an RFC-conformant reference implementation, **not** a hardened
+production MX. It has no anti-spam or abuse layer, accepts any recipient at a
+local domain (catch-all), and has not been security-audited. Before exposing it
+to untrusted mail, read the
+[production-readiness section](../README.md#production-readiness--limitations).
+That section includes the known gaps in the current Hermod code.
 
 ## License
 
-Apache License 2.0 — see the file headers.
+Apache License 2.0. See the file headers.

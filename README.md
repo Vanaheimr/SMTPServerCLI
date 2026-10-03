@@ -4,13 +4,15 @@ A from-scratch SMTP server and outbound client. The protocol stack **lives in th
 [Vanaheimr Hermod](https://github.com/Vanaheimr/Hermod) library** under namespace
 `org.GraphDefined.Vanaheimr.Hermod.SMTP` (folder `Hermod/SMTP/`), replacing
 Hermod's previous SMTP-server implementation; this repository is the thin CLI
-([`SMTPServerCLI/`](../SMTPServerCLI/SMTPServerCLI/README.md)) that wires and
-runs it — a self-contained, config-in-code server instance. Pieces that only make sense when
+([`SMTPServerCLI/`](SMTPServerCLI/README.md)) that wires and runs it — a
+self-contained, config-in-code server instance with an interactive command line
+(Tab completion, accounts, queue, mailbox, DNS records). Pieces that only make sense when
 running an inbound server — the listener, per-connection session, SASL auth,
 connection rate-limiting, mailbox/user storage, and inbound TLS-RPT ingestion —
 live in the child namespace `org.GraphDefined.Vanaheimr.Hermod.SMTP.Server`;
-everything reusable (message model, DKIM/SPF/DMARC/ARC/DANE/TLS-RPT engines, the
-outbound client + queue) stays in `…SMTP`. It implements the modern SMTP
+everything reusable (DKIM/SPF/DMARC/ARC/DANE/TLS-RPT engines, the outbound
+client + queue) stays in `…SMTP`, and the typed message model (`EMail`, the
+builders, addresses) is in `org.GraphDefined.Vanaheimr.Hermod.Mail`. It implements the modern SMTP
 stack — ESMTP, STARTTLS, implicit TLS, SASL AUTH, SPF, DKIM, DMARC, ARC,
 MTA-STS, DANE, TLS-RPT, DSN, MT-PRIORITY — with a strong focus on RFC-correct
 behaviour, cross-validated against independent reference implementations and live
@@ -19,9 +21,11 @@ inbound verify/decrypt), read receipts (MDN), and message importance/priority.
 
 > **Looking for the standards list?** For a per-RFC support reference — every SMTP,
 > TLS, and email-authentication specification with its support level and how it was
-> validated — see [`SMTP_SUPPORT.md`](https://github.com/Vanaheimr/Hermod/blob/master/SMTP_SUPPORT.md)
-> in the Hermod library. This document is the operational guide (architecture,
-> configuration, DNS, deployment, API examples).
+> validated — see [`Hermod/SMTP/README.md`](https://github.com/Vanaheimr/Hermod/blob/master/Hermod/SMTP/README.md)
+> in the Hermod library (locally: [`libs/Hermod/Hermod/SMTP/README.md`](libs/Hermod/Hermod/SMTP/README.md)).
+> This document is the operational guide (architecture, configuration, DNS,
+> deployment, API examples); how to run and drive the server itself is in
+> [`SMTPServerCLI/README.md`](SMTPServerCLI/README.md).
 
 > ### ⚠️ Status: RFC-conformant reference implementation — not a hardened production MX
 >
@@ -45,7 +49,7 @@ inbound verify/decrypt), read receipts (MDN), and message importance/priority.
 - [Message handling](#message-handling)
 - [Standards conformance](#standards-conformance)
 - [Testing & reference implementations](#testing--reference-implementations)
-- [Configuration](#configuration)
+- [Configuration & running](#configuration--running)
 - [DNS setup guide](#dns-setup-guide)
 - [Deployment](#deployment)
 - [Production readiness & limitations](#production-readiness--limitations)
@@ -56,15 +60,19 @@ inbound verify/decrypt), read receipts (MDN), and message importance/priority.
 ## Architecture
 
 All components below live in the Hermod library under `Hermod/SMTP/` (paths in
-the table are relative to that folder); only the CLI entry point
-([`SMTPServerCLI/SMTPServerCLI/`](../SMTPServerCLI/SMTPServerCLI/README.md) —
-`Program.cs` + `Configuration.cs`) sits in this repository.
+the table are relative to that folder); only the runnable instance
+([`SMTPServerCLI/`](SMTPServerCLI/README.md) — `Program.cs`, `Configuration.cs`,
+the wiring in `SMTPServerInstance.cs` and the command line in `CLI/`) sits in
+this repository.
 
 | Component | File (under `Hermod/SMTP/`) | Purpose |
 |-----------|------|---------|
 | `SMTPServer` | `SMTPServer.cs` | TCP listeners for the MTA (25), submission (587) and implicit-TLS submission (465) ports |
 | `SMTPSession` | `SMTPSession.cs` | Per-connection state machine, command handling, DATA/BDAT |
-| `SmtpAuthManager` + handlers | `SMTPAuth.cs` | SASL PLAIN / LOGIN / SCRAM-SHA-256 / EXTERNAL |
+| `SMTPLineReader` | `SMTPLineReader.cs` | CR LF-only line reader: bare CR/LF refused (`RejectBareLineEndings`), the SMTP-smuggling defence |
+| `SmtpAuthManager` + handlers | `SmtpAuthManager.cs`, `*AuthHandler.cs` | SASL PLAIN / LOGIN / SCRAM-SHA-256 / EXTERNAL |
+| `IUserStore` / `FileUserStore` | `IUserStore.cs`, `FileUserStore.cs` | Accounts from `<mailstore>/users.txt` (the CLI wraps it, see [Authentication](#authentication-sasl)) |
+| `ConnectionTracker` | `ConnectionTracker.cs` | Per-IP connection, auth-attempt and message rate limits (`RateLimitConfig`) |
 | `DNSVerifier` | `DNSVerifications/DNSVerifier.cs` | SPF, DKIM, DMARC, MX/A/AAAA/PTR — all via the Hermod `DNSClient` |
 | `DkimSigner` + `DkimCanonicalization` | `DNSVerifications/` | RFC 6376 signing / shared canonicalizer |
 | `SpfMacros` | `DNSVerifications/SpfMacros.cs` | RFC 7208 §7 macro expansion |
@@ -72,20 +80,21 @@ the table are relative to that folder); only the CLI entry point
 | `MailSender` | `MailSender.cs` | MTA outbound entry point for typed `EMail`/`EMailEnvelop` (Hermod.Mail builders): `SendAsync` = queued "letter" delivery; `SendDirectAsync` = synchronous direct-to-MX with a per-domain `SendResult` |
 | `ISMTPSubmissionClient` / `SMTPSubmissionClient` / `NullMailer` | `SMTPSubmissionClient/` | Submission (RFC 6409) client: an app hands a typed message to one configured submission server (587/465, STARTTLS/implicit TLS + SASL AUTH incl. SCRAM-SHA-256), synchronous, returns a `MailSentStatus` (or a detailed `SMTPSendResult` via `SendWithResult`) — the interface an app injects for transactional mail (used by Hermod's HTTP API) |
 | `SMTPOutboundClient` | `SMTPOutboundClient.cs` | MX lookup, STARTTLS, DKIM signing, relay (raw-string `SendAsync` is `internal`) |
-| `MailQueue` / `QueueProcessor` / `BounceHandler` | root | Persistent outbound queue (priority-ordered), retries, DSN failure/delay/success reports |
-| `EMail` + builders + `OpenPGP` | `EMail/`, `BouncyCastle/OpenPGP*.cs` | Typed message model: HTML/text/multipart/attachments, OpenPGP sign/encrypt + inbound verify/decrypt (RFC 3156), read receipts (RFC 8098), importance (RFC 2156) |
-| `Dsn` / `MtPriority` | `Dsn.cs`, `MtPriority.cs` | DSN request + report generation (RFC 3461/3464) and MT-PRIORITY (RFC 6710) parse/format |
-| `FileMailStorage` | `MailStorage/FileMailStorage.cs` | Stores inbound mail as `.eml` files |
-| `MtaStsResolver` | `MtaSts.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
-| `DaneResolver` + `DaneAuthenticator` | `Dane.cs` | RFC 7672 DNSSEC-validated TLSA lookup + certificate matching |
-| `TlsRptResolver` + `TlsRptAggregator` + `TlsRptReportService` | `Reporting/TlsRptReporting.cs` | RFC 8460 SMTP TLS Reporting (outbound TLS success/failure aggregate reports) |
-| `TlsRptIngestor` | `Reporting/TlsRptIngestion.cs` | RFC 8460 inbound report ingestion (decompress + parse TLS reports we receive) |
+| `IMailQueue` / `FileMailQueue` / `QueueProcessor` / `BounceHandler` / `RetryCalculator` | root | Persistent outbound queue (priority-ordered, `<mailstore>/queue/{pending,failed,delivered}`), retries, DSN failure/delay/success reports |
+| `EMail` + builders + `OpenPGP` | `EMail/` (namespace `Hermod.Mail`), `../BouncyCastle/OpenPGP*.cs` | Typed message model: HTML/text/multipart/attachments, OpenPGP sign/encrypt + inbound verify/decrypt (RFC 3156), read receipts (RFC 8098), importance (RFC 2156) |
+| `Dsn*` / `MtPriority` | `Dsn*.cs`, `RecipientDsn.cs`, `MtPriority.cs` | DSN request + report generation (RFC 3461/3464) and MT-PRIORITY (RFC 6710) parse/format |
+| `FileMailStorage` / `MdnGeneratingMailStorage` | `MailStorage/` | Stores inbound mail as `.eml` files; optionally answers read-receipt requests |
+| `RequireTlsHandler` | `RequireTlsHandler.cs` | REQUIRETLS (RFC 8689) on `MAIL FROM` |
+| `MtaStsResolver` | `MtaStsResolver.cs`, `MtaStsPolicy.cs`, `MtaStsMode.cs` | RFC 8461 policy fetch (DNS TXT + HTTPS) |
+| `DaneResolver` + `DaneAuthenticator` | `DaneResolver.cs`, `DaneAuthenticator.cs`, `DaneResult.cs`, `DaneStatus.cs` | RFC 7672 DNSSEC-validated TLSA lookup + certificate matching |
+| `TlsRptResolver` + `TlsRptAggregator` + `TlsRptReportService` | `Reporting/TlsRpt*.cs` | RFC 8460 SMTP TLS Reporting (outbound TLS success/failure aggregate reports) |
+| `TlsRptIngestor` | `Reporting/TlsRptIngestor.cs` | RFC 8460 inbound report ingestion (decompress + parse TLS reports we receive) |
 | `DmarcReportService` + `DmarcAggregator` | `Reporting/` | RFC 7489 §7 aggregate (RUA) + forensic (RUF/ARF) report generation |
 | `ArcValidator` + `ArcSealer` + `ArcChain` | `Arc/` | RFC 8617 Authenticated Received Chain validation and sealing |
 
 All DNS lookups (TXT, MX, A/AAAA, PTR, MTA-STS, TLSA + DNSSEC RRSIG/DNSKEY/DS)
 go through the injected Hermod `DNSClient` — there are no `nslookup`/`dig`
-subprocesses or `System.Net.Dns` calls in the active code.
+subprocesses or `System.Net.Dns` lookups in the active code.
 
 ---
 
@@ -106,7 +115,7 @@ subprocesses or `System.Net.Dns` calls in the active code.
 | `CHUNKING` (`BDAT`) | [RFC 3030](https://www.rfc-editor.org/rfc/rfc3030) | Binary-safe, dot-stuffing-free transfer |
 | `DSN` | [RFC 3461](https://www.rfc-editor.org/rfc/rfc3461) | `ENVID`, `RET`, `NOTIFY`, `ORCPT` parsed; failure/delay/success reports generated |
 | `MT-PRIORITY` | [RFC 6710](https://www.rfc-editor.org/rfc/rfc6710) | `MT-PRIORITY=` parsed from `MAIL FROM`; orders the outbound queue |
-| `STARTTLS` | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207) | Advertised until TLS is active |
+| `STARTTLS` | [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207) | Advertised when a certificate is configured, until TLS is active |
 | `REQUIRETLS` | [RFC 8689](https://www.rfc-editor.org/rfc/rfc8689) | Advertised only after STARTTLS |
 | `AUTH` | [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954) | Mechanisms depend on TLS state |
 
@@ -130,22 +139,32 @@ subprocesses or `System.Net.Dns` calls in the active code.
 
 ## Authentication (SASL)
 
-Implemented in `SMTPAuth.cs` per [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954):
+Implemented in `SmtpAuthManager.cs` and the `*AuthHandler.cs` handlers per [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954):
 
 | Mechanism | RFC | Requires TLS | Notes |
 |-----------|-----|:---:|-------|
 | `PLAIN` | [RFC 4616](https://www.rfc-editor.org/rfc/rfc4616) | yes | Rejected in cleartext (`538`) |
 | `LOGIN` | draft-murchison-sasl-login | yes | Rejected in cleartext |
 | `SCRAM-SHA-256` | [RFC 7677](https://www.rfc-editor.org/rfc/rfc7677) | no | Password never transmitted; mutual auth |
-| `EXTERNAL` | [RFC 4422](https://www.rfc-editor.org/rfc/rfc4422) | yes | Uses the TLS client certificate |
+| `EXTERNAL` | [RFC 4422](https://www.rfc-editor.org/rfc/rfc4422) | yes | Uses the TLS client certificate — currently unreachable, because the server does not request one in the handshake (`ClientCertificateRequired = false`) |
 
-- Submission port (587) requires authentication (RFC 6409).
+- Submission port (587) requires authentication for `DATA` (RFC 6409) — but
+  not yet for `BDAT`, see [limitations](#production-readiness--limitations).
 - Relay to non-local domains requires authentication (no open relay).
-- Per-IP auth-attempt and connection rate limiting.
+- Per-IP auth-attempt and connection rate limiting (`RateLimitConfig.AuthFailDelayMs`
+  is not applied yet).
 
-User store is a flat file (`<mailstore>/users.txt`) — SHA-256 password hashes
-plus SCRAM credentials. **Demonstration only**; use a real database/LDAP for
-production.
+User store is a flat file (`<mailstore>/users.txt`) — unsalted SHA-256 password
+hashes for PLAIN/LOGIN plus SCRAM credentials, and optional client-certificate
+thumbprints for EXTERNAL. **Demonstration grade**; use a real database/LDAP for
+production. Left to itself, Hermod's `FileUserStore` writes demo accounts with
+published passwords (`admin`/`user` = `test123`, `demo` = `demo`) into a missing
+file, and matches a client certificate to an account by its **common name** —
+which anybody can put into a self-signed certificate. The CLI therefore writes
+the file itself on the first start (one account, `admin`, with a random password
+shown once), manages it with its `user` command, and hands the server a
+`PinnedCertificateUserStore` that accepts a client certificate only by a
+thumbprint written down for the account.
 
 ---
 
@@ -155,7 +174,7 @@ production.
 - **Implicit TLS** (RFC 8314) on the submission port **465**: the connection is
   TLS from the first byte, with no plaintext `STARTTLS` upgrade (so no
   downgrade-stripping window). The port is only bound when a certificate is
-  configured; disable it with `EnableImplicitTls = false`. On this port
+  configured; disable it with `SMTPServerConfig.EnableImplicitTls = false`. On this port
   `STARTTLS` is not advertised (already encrypted) and cleartext-sensitive AUTH
   (`PLAIN`/`LOGIN`) is available immediately. Both STARTTLS and implicit TLS
   share one handshake path (`SMTPSession.EstablishTlsAsync`).
@@ -176,7 +195,7 @@ production.
   MX hosts are filtered against the policy in enforce mode.
 - **DANE** ([RFC 7672](https://www.rfc-editor.org/rfc/rfc7672) / [RFC 6698](https://www.rfc-editor.org/rfc/rfc6698),
   opt-in via `Configuration.EnableDane`): before delivering to an MX, `DaneResolver`
-  (`Dane.cs`) looks up `_25._tcp.<mx>` TLSA records and **DNSSEC-validates** them
+  (`DaneResolver.cs`) looks up `_25._tcp.<mx>` TLSA records and **DNSSEC-validates** them
   with Hermod's `DNSSECValidator` (full chain of trust to the IANA root).
   - *Secure* TLSA records → STARTTLS is **enforced** and the server certificate
     must match a record (`DaneAuthenticator`): usages DANE-EE(3) / DANE-TA(2),
@@ -210,7 +229,9 @@ production.
   the RFC 8460 §4 JSON is parsed, the raw report is stored under
   `<mailstore>/tls-reports-received/`, and a success/failure summary is logged.
 - **REQUIRETLS** ([RFC 8689](https://www.rfc-editor.org/rfc/rfc8689)): honored on
-  `MAIL FROM` and propagated to enforced outbound delivery.
+  `MAIL FROM`; for mail sent through `MailSender` (`EMailEnvelop.RequireTls`) it
+  is carried to enforced outbound delivery. Inbound mail that is **relayed** does
+  not carry it onto the queue yet (see [limitations](#production-readiness--limitations)).
 
 ---
 
@@ -229,7 +250,8 @@ written into an `Authentication-Results` header
   **10-DNS-lookup limit** (§4.6.4).
 - **Macro expansion** (§7): `s l o d i p v h`, digit/`r`/delimiter transformers,
   `%% %_ %-`, uppercase URL-escaping. Validated against the RFC 7208 §7.4 vectors.
-- Hard `-all` failures are rejected at RCPT/DATA (`550 5.7.23`).
+- Hard `-all` failures are rejected after the message has been received —
+  at the end of `DATA` or `BDAT LAST` (`550 5.7.23`).
 
 ### DKIM — [RFC 6376](https://www.rfc-editor.org/rfc/rfc6376) ✅ complete
 
@@ -313,8 +335,10 @@ still trust them after SPF/DKIM break in transit.
   and comma-aware list splitting.
 - **DSN / bounces** (RFC 3461/3464): failure/delay/**success** delivery-status
   notifications and `multipart/report` bounces; a sender can request notifications
-  (`NOTIFY`/`RET`/`ENVID`), which are emitted on `MAIL FROM`/`RCPT TO` only when the
-  remote advertises DSN; null sender (`<>`) handled to avoid bounce loops.
+  (`NOTIFY`/`RET`/`ENVID`, via `EMailEnvelop.Dsn`), which are emitted on
+  `MAIL FROM`/`RCPT TO` only when the remote advertises DSN; null sender (`<>`)
+  handled to avoid bounce loops. DSN parameters a client gives for mail the
+  server then **relays** are parsed but not carried onto the queue yet.
 - **Read receipts** (MDN, RFC 8098): a client can request one (the builder's
   `DispositionNotificationTo`) and generate one from a received `EMail`
   (`CreateReadReceipt`, see below).
@@ -345,7 +369,7 @@ your host may deliver directly → ③**.
 var mail = new HTMLEMailBuilder { Subject = "…", HTMLText = "…", PlainText = "…" };
 mail.From = SimpleEMailAddress.Parse("me@example.com");
 mail.To   = (EMailAddress) SimpleEMailAddress.Parse("you@example.org");
-mail.AddAttachment(pdfBytes, "rechnung.pdf");
+mail.AddAttachment(pdfBytes, "rechnung.pdf", MailContentTypes.application_octet__stream);  // default: text/plain
 
 // ① Letter — queue; a running QueueProcessor does MX/TLS/DANE delivery, bounces on failure.
 await new MailSender(mailQueue, logger).SendAsync(mail);
@@ -355,7 +379,7 @@ ISMTPSubmissionClient smtp = new SMTPSubmissionClient(
     DomainName.Parse("smtp.example.com"), IPPort.Parse(587),
     Login: "app", Password: "…", UseTLS: TLSUsage.STARTTLS, DNSClient: dnsClient);
 var r2 = await smtp.Send(mail);                    // NullMailer for tests / no-mail
-if (r2 != MailSentStatus.ok) { /* InvalidLogin, ConnectionClosed, Timeout, MessageSizeExceeded, … */ }
+if (r2 != MailSentStatus.ok) { /* InvalidLogin, ConnectionClosed, Timeout, MessageSizeExceeded, TLSUnavailable, … */ }
 
 // …or the detailed result: final reply + enhanced status + per-recipient verdicts.
 var d2 = await smtp.SendWithResult(mail);          // implicitly reduces to MailSentStatus
@@ -576,9 +600,10 @@ await sender.SendAsync(new EMailEnvelop(b) { Priority = 4 });   // MT-PRIORITY=4
 | 6710 | MT-PRIORITY | ✅ EHLO/MAIL FROM + priority-ordered outbound queue |
 | 2156 | Message importance (`Importance`) | ✅ header-level, build + parse |
 | 4954 | SMTP AUTH | ✅ |
-| 4616 / 7677 / 4422 | PLAIN / SCRAM-SHA-256 / EXTERNAL | ✅ |
-| 6409 | Message submission | ✅ (auth required on 587) |
-| 8689 | REQUIRETLS | ✅ |
+| 4616 / 7677 | PLAIN / SCRAM-SHA-256 | ✅ |
+| 4422 | EXTERNAL | ⚠️ implemented, unreachable — no client certificate is requested |
+| 6409 | Message submission | ⚠️ auth required on 587 for `DATA`, not yet for `BDAT` |
+| 8689 | REQUIRETLS | ✅ on `MAIL FROM` and for `MailSender`; ⚠️ not propagated on relay |
 | 8461 | MTA-STS | ✅ |
 | 8460 | TLS-RPT (SMTP TLS Reporting) | ✅ outbound reports + inbound ingestion (opt-in) |
 | 7208 | SPF (incl. macros §7) | ✅ complete |
@@ -618,40 +643,47 @@ TLS-RPT).
 | **DMARC reporting** | Aggregator grouping/counts + JSON persistence across restart; the full send pipeline (MIME + gzip + external-dest consent) through a fake queue; the gzipped attachment is gunzipped and the RFC 7489 XML is parsed and asserted (policy, per-row counts, alignment, `header_from`, `auth_results`); ARF forensic report structure + hourly rate limit. |
 | **ARC** | Cross-validated **both directions** with Python **`dkimpy`**: dkimpy verifies our 1-hop and 2-hop sealed chains (`cv=pass`), and our validator accepts a dkimpy-sealed message. Plus self-tests: seal↔validate round-trip, 2-hop chain, body/seal tamper detection, and cv-chain enforcement. |
 | **E-mail builders & OpenPGP** | 33 tests in `HermodTests/SMTP/EMailBuilderTests.cs` (RSA key rings generated in-test). Build side: HTML/Text × attachment × PGP matrix, each built, serialized and **re-parsed** (round-trip) with signatures cryptographically verified and the multipart tree reconstructed; all five `EMailSecurity` modes (incl. `autosign`/`auto` graceful degradation); encryption round-trips that actually **decrypt** back to the plaintext; multi-recipient encryption addressing (and decrypting for) every `To`. Inbound side: `IsPgpSigned`/`IsPgpEncrypted`, `VerifyPgpSignature` (Valid / tampered→Invalid / wrong-key→NoMatchingKey / unsigned→NoSignature / a hand-assembled *foreign* serialization verified via raw bytes), `DecryptPgp`, and `DecryptAndVerifyPgp`. This work uncovered and fixed several real bugs: three MIME re-parse bugs, `EMailSecurity.encrypt` silently sending plaintext, and encrypt addressing only the first `To`. |
-| **Receipts, DSN & priority** | `MdnTests` (6): read-receipt request detection and RFC 8098 `multipart/report` generation (fields, re-parse, disposition types). `DsnTests` (9): the MAIL FROM / RCPT TO `NOTIFY`/`RET`/`ENVID`/`ORCPT` construction (only when the remote supports DSN), the sender facade threading the request onto the queued mail, and a success DSN queued back to the sender only when `NOTIFY=SUCCESS`. `PriorityTests` (13): `Importance` header emission/parse/precedence and MT-PRIORITY helpers plus an end-to-end `FileMailQueue` ordering check (enqueued `0,5,-3,9,2` → drained `9,5,2,0,-3`). |
+| **Receipts, DSN & priority** | `MdnTests` (6): read-receipt request detection and RFC 8098 `multipart/report` generation (fields, re-parse, disposition types). `DsnTests` (13): the MAIL FROM / RCPT TO `NOTIFY`/`RET`/`ENVID`/`ORCPT` construction (only when the remote supports DSN), the sender facade threading the request onto the queued mail, and a success DSN queued back to the sender only when `NOTIFY=SUCCESS`. `PriorityTests` (13): `Importance` header emission/parse/precedence and MT-PRIORITY helpers plus an end-to-end `FileMailQueue` ordering check (enqueued `0,5,-3,9,2` → drained `9,5,2,0,-3`). |
 | **DANE / DNSSEC** | Live TLSA lookups + full **DNSSEC chain validation** against real signed zones (`posteo.de`, `mailbox.org` → `Secure`/usable; `gmail.com` → no DANE); deterministic certificate-matcher tests (`3 1 1`/`3 1 2`/`3 0 0`/`3 0 1`, tamper → no match, PKIX-usage ignored, DANE-TA). This work exposed and fixed three DNSSEC-stack bugs in Hermod (missing EDNS DO bit, root-name wire-encoding FORMERR, unsupported RSA-SHA1). |
 | **TLS-RPT (outbound)** | Record parsing, aggregation (successes + typed failures, MX aggregation), and RFC 8460 §4 JSON re-parsed and field-checked; live `_smtp._tls` lookup (`google.com`/`gmail.com` → real `rua`). |
 | **TLS-RPT (inbound)** | Closed-loop ingestion: a gzipped `multipart/report` **and** an uncompressed `application/tlsrpt+json` both parse to the expected session/failure counts and persist; an ordinary message is not misdetected; `ParseJson` tolerates missing fields and rejects garbage. |
 
 ---
 
-## Configuration
+## Configuration & running
 
 The bundled CLI is **configured in code — there are no environment variables.**
-Every setting (hostname, ports, local domains, DKIM domain/selector, the
-verification and reporting flags, smarthost, rate limits, queue tuning) is a
-typed constant in
-[`SMTPServerCLI/SMTPServerCLI/Configuration.cs`](../SMTPServerCLI/SMTPServerCLI/Configuration.cs);
-edit it and rebuild. Crypto material (a self-signed TLS certificate and the DKIM
-key pair) is generated on first run into the git-tracked `config/` folder, so a
+Every default (hostname, ports, local domains, DKIM domain/selector, the
+reporting flags, smarthost, rate limits, queue tuning) is a typed constant in
+[`SMTPServerCLI/Configuration.cs`](SMTPServerCLI/Configuration.cs); edit it and
+rebuild to change one for good. The most common ones can also be changed for a
+single start with a switch (`--hostname`, `--local-domain`, `--port`,
+`--certificate`, `--smarthost`, … — `-h` lists them), which is written nowhere.
+Crypto material (a self-signed TLS certificate and the DKIM key pair) is
+generated on first run into the git-tracked `SMTPServerCLI/config/` folder, so a
 fresh clone runs as-is and the DKIM key can be committed to stay stable.
 
-**See the CLI project's own guide —
-[`SMTPServerCLI/SMTPServerCLI/README.md`](../SMTPServerCLI/SMTPServerCLI/README.md)**
-— for the full settings table, the `config/` vs `mailstore/` folder layout, user
-accounts, and a production deployment walkthrough (privileged ports, real
-certificate, systemd unit).
+Once it runs, the server has a **command line** with Tab completion: `status`,
+`config`, `user` (accounts), `queue` (outbound queue), `mailbox` (received mail),
+`dns` (the records to publish, and `dns check` whether they are), `testmail`,
+`log`. Under systemd or with redirected output there is no prompt and it simply
+runs until SIGTERM.
 
-Ports default to 2525/2587/2465 so the server runs without root. Default users
-(`admin`/`user` = `test123`, `demo` = `demo`) are created on first run —
-**change these before any real use.**
+**See the CLI project's own guide —
+[`SMTPServerCLI/README.md`](SMTPServerCLI/README.md)** — for the switches, the
+commands, the `config/` vs `mailstore/` folder layout, user accounts, and a
+production deployment walkthrough (privileged ports, real certificate, systemd
+unit).
+
+Ports default to 2525/2587/2465 so the server runs without root. The first
+start creates one account, `admin`, with a random password that the banner shows
+once — `user passwd admin` changes it.
 
 ### Run
 
 ```sh
-git submodule update --init --depth 1 libs/Hermod libs/Styx
-cd SMTPServerCLI/SMTPServerCLI
-dotnet run
+git submodule update --init --recursive
+dotnet run --project SMTPServerCLI
 ```
 
 ---
@@ -693,8 +725,10 @@ example.com.  IN TXT "v=spf1 mx a:mail.example.com -ip4:192.0.2.10 ~all"
 
 ### 4. DKIM — publish the public key
 
-On first run the server writes the key material to `<mailstore>/dkim_<selector>.*`.
-The `.dns.txt` file already contains the record to publish:
+On first run the server writes the key material to `config/dkim_<selector>.*`.
+The `dns` command at the server's prompt prints the record to publish, computed
+from the key it signs with and already split into character-strings (the
+`.dns.txt` file has it too, as one string, for the domain it was generated for):
 
 ```dns
 default._domainkey.example.com. IN TXT "v=DKIM1; k=rsa; p=MIIBIjANBgkq...QAB"
@@ -755,6 +789,11 @@ your own needed for that).
 
 ### Verify your setup
 
+At the server's prompt, `dns check` looks up the A/AAAA, MX, SPF, DMARC and DKIM
+records through the same resolver the server uses and says which are missing —
+and whether the published DKIM key is the one the server signs with. From any
+shell:
+
 ```sh
 dig +short MX      example.com
 dig +short TXT     example.com                     # SPF
@@ -764,23 +803,27 @@ dig +short TXT     _smtp._tls.example.com          # TLS-RPT
 dig +short -x      192.0.2.10                      # PTR
 ```
 
-Send a test message to a Gmail account and read the *Show original* →
+Send a test message to a Gmail account — `testmail you@gmail.com` at the
+server's prompt — and read the *Show original* →
 `SPF/DKIM/DMARC: PASS` lines, or use a checker like mail-tester.com.
 
 ---
 
 ## Deployment
 
-1. **Real TLS certificate** for `mail.example.com` (e.g. Let's Encrypt); load it
-   as PKCS#12 and point `CertificatePath`/`CertificatePassword` at it. Do not
-   ship the self-signed default.
+1. **Real TLS certificate** for `mail.example.com` (e.g. Let's Encrypt); export
+   it as PKCS#12 and either replace `config/server.pfx` (password:
+   `Configuration.CertificatePassword`) or start with `--certificate <file.pfx>
+   --certificate-password <pw>`. Do not ship the self-signed default.
 2. **Bind to ports 25, 587 and 465** (465 needs a certificate). This needs
    elevated privileges or a capability/`setcap`; or run behind a port-forward.
 3. **Open the firewall** for 25/587/465 inbound and **25 outbound** (many
    networks block outbound 25 — you then need a smarthost).
 4. **Static IP with matching PTR** (see DNS guide) and not on any blocklist.
-5. **Replace the demo user store** and rotate DKIM keys periodically.
-6. **Monitor** the queue, logs, and DMARC/TLS reports.
+5. **Accounts:** keep the generated `admin` password or set a new one with
+   `user passwd admin`; add one per sending client with `user add <name>`. Rotate
+   DKIM keys periodically (a new `--dkim-selector` gets a new key pair).
+6. **Monitor** the queue (`status`, `queue`), the logs, and DMARC/TLS reports.
 
 ---
 
@@ -799,6 +842,23 @@ Honest list of what stands between this and a production Internet MX:
   have not been fuzzed or reviewed for DoS/injection.
 - **Operational gaps** — no mail-loop/`Received`-hop-count limit,
   no metrics/alerting; queue durability is not battle-tested.
+- **Known gaps in the current Hermod code** (found while bringing the CLI up to
+  date; each is a fix in Hermod, not here):
+  - `BDAT` on the submission ports does not check `RequireAuthOnSubmission`, so
+    an unauthenticated client can deliver to **local** recipients there with
+    `CHUNKING` (relay still requires authentication).
+  - `AUTH EXTERNAL` is unreachable (no client certificate is requested), and
+    `FileUserStore` would match a certificate to an account by its common name;
+    the CLI's `PinnedCertificateUserStore` already only accepts pinned
+    thumbprints.
+  - `REQUIRETLS` and the DSN parameters of inbound mail that is relayed are not
+    carried onto the outbound queue.
+  - `SMTPServerConfig.VerifySpf`/`VerifyDkim`/`VerifyDmarc` and
+    `RateLimitConfig.AuthFailDelayMs` are logged but not applied; the checks
+    always run.
+  - A recipient domain with a null MX (RFC 7505, `0 .`) is deferred and retried
+    instead of bounced at once.
+  - Passwords for PLAIN/LOGIN are stored as unsalted SHA-256.
 - **Header internationalization** (RFC 2047 encoded-words / RFC 6532) is only
   partially handled.
 
