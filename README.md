@@ -679,8 +679,10 @@ fresh clone runs as-is and the DKIM key can be committed to stay stable.
 Once it runs, the server has a **command line** with Tab completion: `status`,
 `config`, `user` (accounts), `queue` (outbound queue), `mailbox` (received mail),
 `dns` (the records to publish, and `dns check` whether they are), `testmail`,
-`log`. Under systemd or with redirected output there is no prompt and it simply
-runs until SIGTERM.
+`log`, `who`. Under systemd or with redirected output there is no prompt and it
+simply runs until SIGTERM; the same command line is then reached **over SSH**
+(`ssh -p 22525 <account>@localhost`, public keys only, accounts of their own),
+built on Hermod's SSH server.
 
 **See the CLI project's own guide —
 [`SMTPServerCLI/README.md`](SMTPServerCLI/README.md)** — for the switches, the

@@ -9,6 +9,9 @@ commit to the repository (that is the point of this self-contained CLI — see
 | `server.pfx` | TLS certificate + private key for STARTTLS / implicit TLS. A **self-signed** cert is generated on first run — replace it with a real certificate (e.g. Let's Encrypt) for the MX hostname before going live. | your call |
 | `dkim_<selector>.private.pem` | DKIM signing key (the private half). Keep it stable so the published DNS record stays valid. | yes (so the key is stable) |
 | `dkim_<selector>.public.pem` | DKIM public key. | yes |
+| `ssh/ssh_host_ed25519_key` | The SSH host key of the command line (the private half), generated on the first start that serves SSH. Clients remember it; a new one looks to them like another machine. | your call |
+| `ssh/ssh_host_ed25519_key.pub` | Its public half. | yes |
+| `ssh/authorized/<account>` | The public keys an SSH account may sign in with, in OpenSSH's `authorized_keys` format. Written by `--authorize-ssh-key`, editable by hand. | yes |
 | `dkim_<selector>.dns.txt` | The `TXT` record to publish at `<selector>._domainkey.<domain>`, for the domain the key was generated with. The `dns` command at the server's prompt prints the current record, already split into 255-character strings. | yes |
 
 Nothing here is read from environment variables. To change a default for good (the hostname,

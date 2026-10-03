@@ -86,6 +86,10 @@ dotnet run --project SMTPServerCLI -- --hostname mail.example.org --local-domain
 | `--require-starttls` | Refuse `MAIL FROM` on the MTA port until STARTTLS has been negotiated. |
 | `--dkim-domain <domain>`, `--dkim-selector <selector>` | The DKIM `d=` and `s=` values. A selector without a key yet gets a newly generated key pair. |
 | `--smarthost <host[:port]>`, `--smarthost-user <name>`, `--smarthost-password <pw>` | Relay all outgoing mail through this server instead of each recipient domain's MX. Use this where outbound port 25 is blocked. |
+| `--ssh-port <number>` | The port the command line is served on over SSH. Default: 22525. |
+| `--ssh-any` | Serve SSH on every address instead of the loopback only. |
+| `--no-ssh` | Do not serve the command line over SSH. |
+| `--authorize-ssh-key <account>=<file.pub>` | Let an account in over SSH with the public key in the file: an OpenSSH `.pub`, or what PuTTYgen saves. Can be given several times. |
 | `--config <dir>`, `--mailstore <dir>` | Override where the crypto material and the runtime data live. |
 | `--verbose`, `--quiet`, `--log-level <level>` | How much of the log the console shows: `debug`, `info` (the default), `warning`, `error` or `off`. |
 | `--version` | Print the commit each assembly was built from, then exit. |
@@ -127,12 +131,54 @@ the outbound queue on disk for the next start.
 | `dns [records]` | Prints the DNS records this server needs: MX, A/AAAA, PTR, SPF, DKIM, DMARC, TLS-RPT, and DANE/TLSA when the certificate is a real one. The DKIM record is computed from the key the server actually signs with and is split into 255-character strings. |
 | `dns check` | Looks those records up through the server's own resolver and reports which are missing. It also checks whether the published DKIM key matches the server's key. |
 | `testmail <to> [<from>]` | Queues a short DKIM-signed test message to an external address. Read SPF, DKIM and DMARC from the recipient's "show original". |
-| `log [debug\|info\|warning\|error\|off]` | Shows or changes how much of the log the console shows. |
+| `log [debug\|info\|warning\|error\|off]` | Shows or changes how much of the log the console shows. In an SSH session it changes only that session's log. |
+| `who` | Lists who is signed in over SSH: account, address, key and since when. |
 | `history`, `quit` / `exit` | From Styx's command line. |
 
 When the server runs under systemd, from a script, or with its output
 redirected, there is no prompt. It simply runs until SIGTERM, and the console
-shows only the log.
+shows only the log. The command line is then reached over SSH.
+
+## Typing at it over SSH
+
+The same command line is served over SSH, on `127.0.0.1:22525` by default.
+This is how you reach it on a server started by systemd, which has no console.
+You get the same commands, Tab completion, history and log above the line being
+typed. `quit`, `exit` or Ctrl+D end the session; the server keeps running.
+
+Only the command line is served: no shell of the machine, no files, no tunnels.
+Sign-in is by **public key only**. The SSH accounts are separate from the SMTP
+accounts in `users.txt`: an SMTP account may send mail, an SSH account may run
+the server. That way the password of a mail client is never a way into the
+console.
+
+To let yourself in, start once with your public key:
+
+```sh
+dotnet run --project SMTPServerCLI -- --authorize-ssh-key alice=path/to/id_ed25519.pub
+```
+
+The key is written to `config/ssh/authorized/alice`, a file in OpenSSH's
+`authorized_keys` format, and stays there for later starts. You can also edit
+that file by hand; it is read again at every sign-in. Options such as `from=`,
+`no-pty` and `expiry-time=` are honoured; a line with an option the server
+cannot enforce is refused rather than half-honoured.
+
+Then connect:
+
+```sh
+ssh -p 22525 alice@localhost
+```
+
+From another machine, use a tunnel (`ssh -L 22525:127.0.0.1:22525 you@mail.example.com`)
+or start with `--ssh-any`. The first connection shows the server's host key;
+compare it with the fingerprint in the banner (`SSH` line). The host key is
+generated on the first start and kept in `config/ssh/ssh_host_ed25519_key`.
+
+Each session has its own log level (`log`), and the server's log names who did
+what: `'alice' over SSH from 127.0.0.1:51682 added the account 'bob'.` Sign-ins,
+failed attempts and refused requests are logged as well. With no account
+having a key, SSH listens and lets nobody in.
 
 ### Adding a command
 
@@ -151,7 +197,7 @@ instead. `--config` and `--mailstore` override either location.
 
 | Folder | Contents | Committed? |
 |--------|----------|------------|
-| [`config/`](config/) | TLS certificate and DKIM keys, generated on the first start. | Tracked. Commit the keys if you want them to stay stable. |
+| [`config/`](config/) | TLS certificate, DKIM keys and SSH host key, generated on the first start, and the public keys of the SSH accounts (`config/ssh/authorized/`). | Tracked. Commit the keys if you want them to stay stable. |
 | `mailstore/` | Received `.eml` files, the outbound queue (`queue/pending`, `queue/failed`, `queue/delivered`), `users.txt` and the reporting state. | **Git-ignored**: runtime data, including credential hashes. |
 
 ## User accounts
@@ -218,7 +264,8 @@ Generated passwords are the safer choice. A password typed after `user add` or
    ```
 
    Under systemd there is no prompt. The server logs to the journal and stops
-   on SIGTERM.
+   on SIGTERM. Its command line is reached with `ssh -p 22525 <account>@localhost`
+   on the machine; see [Typing at it over SSH](#typing-at-it-over-ssh).
 
 ## Status
 
