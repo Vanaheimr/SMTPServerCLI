@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  # Pull requests: one run per branch, newest wins. Pushes: one run per commit,
+  # and nothing cancels anything - a commit with no verdict is a hole nobody
+  # comes back to fill. The same arrangement as Hermod, EVCLI and the other
+  # repositories of this stack.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # One leg per platform this server is used on:
+  #
+  #  * Windows, where it is developed and typed at.
+  #  * Debian 13, where it is deployed - as a systemd service, which is why the
+  #    start below is the Linux one. GitHub has no Debian runner image, so this
+  #    leg is an Ubuntu runner carrying a debian:13 container.
+  #
+  # fail-fast is off: "red on exactly one platform" is the most useful thing a
+  # two-leg matrix says, so one leg must not cancel the other.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            leg: windows-latest
+          - os: ubuntu-latest
+            container: debian:13
+            leg: debian-13-container
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+
+      # Before the checkout: the deepest paths below the clone root are long
+      # enough for the classic 260-character limit to stop a submodule halfway.
+      - name: Allow long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      # Also before the checkout: without git, actions/checkout falls back to a
+      # tarball, which brings no submodules - and the failure would only show
+      # later, as a missing Hermod. The rest is what .NET needs on a bare Debian.
+      - name: Install prerequisites (Debian container)
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git libicu76 libssl3t64 libstdc++6 tzdata && git config --global --add safe.directory '*'
+
+      # The libraries at the commits this repository pins: whether this
+      # combination of Hermod and Styx works is the question asked here.
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # The whole solution, the libraries' own test projects included: that
+      # they still compile together at these gitlinks is worth knowing too.
+      - name: Build
+        run: dotnet build SMTPServerCLI.slnx --configuration Release
+
+      # The server's own tests: the switches, users.txt and the certificate
+      # store, the SSH accounts - and the server started on free ports in a
+      # folder of its own, spoken to over SMTP, at its prompt and over SSH.
+      # Hermod and Styx gate their own suites in their own repositories.
+      - name: Test
+        timeout-minutes: 10
+        run: dotnet test SMTPServerCLITests/SMTPServerCLITests.csproj --configuration Release --no-build --logger "console;verbosity=normal" --logger "trx;LogFileName=${{ matrix.leg }}.trx" --results-directory artifacts
+
+      # The question no test in-process asks: does the program start, as
+      # systemd starts it - no terminal, output into a file - answer on its
+      # ports, and stop cleanly on SIGTERM, with exit code 0?
+      #
+      # Everything it writes goes to a temporary directory: a first start makes
+      # a certificate, DKIM and SSH keys and a users.txt, none of which belongs
+      # in a workspace whose cleanliness the build stamps into every assembly.
+      # Ports of its own, below the range Linux hands out to outgoing
+      # connections (32768-60999).
+      - name: The server starts, answers and stops (Debian)
+        if: matrix.leg == 'debian-13-container'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -u
+          tmp="$(mktemp -d)"
+          dotnet SMTPServerCLI/bin/Release/net10.0/SMTPServerCLI.dll \
+              --hostname           ci.example.org \
+              --port               12525 \
+              --submission-port    12587 \
+              --implicit-tls-port  12465 \
+              --ssh-port           22125 \
+              --config             "$tmp/config" \
+              --mailstore          "$tmp/mailstore" \
+              > "$tmp/console.log" 2>&1 &
+          pid=$!
+
+          # The first line each port says: a 220 greeting from SMTP, an
+          # identification string from SSH. "|| true" so that a port not yet
+          # open is an empty answer rather than the end of this shell.
+          first_line() { timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1 && head -n 1 <&3" 2>/dev/null | tr -d '\r' || true; }
+
+          smtp=""
+          for _ in $(seq 1 60); do
+              smtp="$(first_line 12525)"
+              [ -n "$smtp" ] && break
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 1
+          done
+
+          submission="$(first_line 12587)"
+          ssh_banner="$(first_line 22125)"
+
+          kill -TERM "$pid" 2>/dev/null || true
+          stopped=1
+          for _ in $(seq 1 30); do
+              kill -0 "$pid" 2>/dev/null || { stopped=0; break; }
+              sleep 1
+          done
+          wait "$pid" 2>/dev/null
+          exit_code=$?
+
+          echo "SMTP 12525        -> ${smtp:-nothing}"
+          echo "submission 12587  -> ${submission:-nothing}"
+          echo "SSH 22125         -> ${ssh_banner:-nothing}"
+          echo "SIGTERM           -> $([ "$stopped" = 0 ] && echo "stopped, exit code $exit_code" || echo "still running")"
+
+          # What the banner says this was built from - in every run, because a
+          # stamp that reads "unknown" or "-dirty" is worth seeing while green.
+          awk '/^  built from/ { f = 1 } f && !/^  built from/ && !/^                   / { f = 0 } f' "$tmp/console.log" || true
+
+          fault=0
+          case "$smtp"       in 220\ ci.example.org*) ;; *) echo "The MTA port did not greet."; fault=1 ;; esac
+          case "$submission" in 220\ ci.example.org*) ;; *) echo "The submission port did not greet."; fault=1 ;; esac
+          case "$ssh_banner" in SSH-2.0-*)            ;; *) echo "The SSH server did not answer."; fault=1 ;; esac
+          if [ "$stopped" != 0 ]; then
+              echo "SIGTERM did not stop it."
+              kill -KILL "$pid" 2>/dev/null || true
+              fault=1
+          elif [ "$exit_code" != 0 ]; then
+              echo "It stopped on SIGTERM, but with exit code $exit_code."
+              fault=1
+          fi
+
+          if [ "$fault" != 0 ]; then
+              echo
+              echo "What it said, without the first-start password:"
+              grep -v -i password "$tmp/console.log" || echo "(nothing at all)"
+              exit 1
+          fi
+
+      # The same question in the form the other leg answers without process
+      # control: the assembly loads, its switches parse, it exits 0.
+      - name: The server runs (Windows)
+        if: runner.os == 'Windows'
+        run: dotnet SMTPServerCLI/bin/Release/net10.0/SMTPServerCLI.dll --help
+
+      # TRX keeps, per test, outcome, duration, message and stack trace. Also
+      # on red - that is when it is wanted.
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.leg }}
+          path: artifacts/*.trx
