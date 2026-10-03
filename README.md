@@ -151,6 +151,9 @@ Implemented in `SmtpAuthManager.cs` and the `*AuthHandler.cs` handlers per [RFC 
 - Submission ports (587, 465) require authentication before a message is
   accepted, by `DATA` or `BDAT` (RFC 6409).
 - Relay to non-local domains requires authentication (no open relay).
+- A completed `AUTH` lasts for the session (`RSET` keeps it, a second `AUTH` is
+  `503`), but not across `STARTTLS`: an `AUTH` from before the upgrade is
+  discarded (RFC 3207 §4.2), and the client authenticates again inside TLS.
 - Per-IP auth-attempt and connection rate limiting; a failed `AUTH` is answered
   only after `AuthFailDelayMs` (3 s) and counts towards the per-IP limit.
 
@@ -171,6 +174,9 @@ reads the thumbprints the way the `user` command shows them.
 ## Transport security (TLS)
 
 - **STARTTLS** (RFC 3207) on the MTA (25) and submission (587) ports, TLS 1.2 / 1.3.
+  After the upgrade the server discards what it learned from the client in
+  cleartext (§4.2): the mail transaction and a completed `AUTH`. The client
+  sends `EHLO` again; its TLS client certificate, part of the negotiation, stays.
 - **Implicit TLS** (RFC 8314) on the submission port **465**: the connection is
   TLS from the first byte, with no plaintext `STARTTLS` upgrade (so no
   downgrade-stripping window). The port is only bound when a certificate is
@@ -436,7 +442,10 @@ recipient. Modes ① and ③ are `SMTPOutboundClient` under the hood; mode ② i
 `SMTPSubmissionClient` additionally requests DSN/MT-PRIORITY/REQUIRETLS from the
 envelope, detects a dropped or stalled connection immediately
 (`MailSentStatus.ConnectionClosed` / `.Timeout`), retries only transient transport
-failures, and runs fully-async I/O. `Send` returns the coarse `MailSentStatus`;
+failures, and runs fully-async I/O. In `STARTTLS` mode it never falls back to
+cleartext: `STARTTLS` not offered or refused, data behind the server's `220`, or a
+handshake that fails or does not complete within `CommandTimeout` ends the attempt
+with `MailSentStatus.TLSUnavailable`, without retry. `Send` returns the coarse `MailSentStatus`;
 `SendWithResult` returns a richer `SMTPSendResult` (final SMTP reply, RFC 3463
 enhanced status, per-recipient `RCPT TO` verdicts, attempts, TLS/auth state,
 runtime) that still implicitly reduces to `MailSentStatus` for legacy call sites.
