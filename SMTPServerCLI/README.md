@@ -267,6 +267,24 @@ Generated passwords are the safer choice. A password typed after `user add` or
    on SIGTERM. Its command line is reached with `ssh -p 22525 <account>@localhost`
    on the machine; see [Typing at it over SSH](#typing-at-it-over-ssh).
 
+## Tests and CI
+
+```sh
+dotnet test SMTPServerCLITests
+```
+
+[`SMTPServerCLITests/`](../SMTPServerCLITests/) covers the switches, `users.txt`
+and the certificate lookup, the SSH accounts, and the server itself: started on
+free ports in a temporary folder, sent a message over SMTP, typed at through
+its commands and Tab completion, and signed in to over SSH with Hermod's own
+client. Nothing in it depends on name servers elsewhere.
+
+[CI](../.github/workflows/ci.yml) builds the whole solution and runs these tests
+on Windows and Debian 13, for every push and pull request. On Debian it also
+starts the program the way systemd does: no terminal, output into a file. It
+then checks that both SMTP ports greet with `220`, that SSH answers, and that
+SIGTERM stops the server with exit code 0.
+
 ## Status
 
 This is an RFC-conformant reference implementation, **not** a hardened
@@ -277,4 +295,4 @@ to untrusted mail, read the
 
 ## License
 
-Apache License 2.0. See the file headers.
+Apache License 2.0. See [`LICENSE`](../LICENSE).

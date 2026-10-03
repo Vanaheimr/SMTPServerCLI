@@ -875,3 +875,9 @@ core it is designed to be.
 - SPF `exp=` explanation strings and the `ptr` mechanism.
 - A real mailbox store (IMAP/POP or Maildir) and quota handling.
 - Anti-spam / greylisting / DNSBL integration.
+
+---
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).
