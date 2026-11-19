@@ -45,7 +45,7 @@ In an existing clone without the libraries:
 git submodule update --init --recursive
 ```
 
-You need the .NET 10 SDK.
+You need the .NET 11 SDK.
 
 ## Building and running
 

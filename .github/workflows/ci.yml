@@ -63,7 +63,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '11.0.x'
 
       # The whole solution, the libraries' own test projects included: that
       # they still compile together at these gitlinks is worth knowing too.
@@ -94,7 +94,7 @@ jobs:
         run: |
           set -u
           tmp="$(mktemp -d)"
-          dotnet SMTPServerCLI/bin/Release/net10.0/SMTPServerCLI.dll \
+          dotnet SMTPServerCLI/bin/Release/net11.0/SMTPServerCLI.dll \
               --hostname           ci.example.org \
               --port               12525 \
               --submission-port    12587 \
@@ -163,7 +163,7 @@ jobs:
       # control: the assembly loads, its switches parse, it exits 0.
       - name: The server runs (Windows)
         if: runner.os == 'Windows'
-        run: dotnet SMTPServerCLI/bin/Release/net10.0/SMTPServerCLI.dll --help
+        run: dotnet SMTPServerCLI/bin/Release/net11.0/SMTPServerCLI.dll --help
 
       # TRX keeps, per test, outcome, duration, message and stack trace. Also
       # on red - that is when it is wanted.
