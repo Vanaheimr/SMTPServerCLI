@@ -237,14 +237,14 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             Context.WindowChanged += changed => terminal.Width = Columns(changed);
             Context.Signalled     += signal  => { if (signal is "INT" or "TERM") terminal.Interrupt(); };
 
-            using var cli = new SMTPCLI(smtp, terminal, session.Username, from);
+            using var cli = new SMTPCLI(smtp, terminal, session.Username.ToString(), from);
 
             // The log, from where the console shows it, written around the line being typed.
             cli.SessionLog = smtp.Logger.Listen(smtp.Logger.MinimumLevel ?? LogLevel.Info,
                                                 (level, line, color) => cli.WriteBlock(t => t.WriteLine(line, color)));
 
             sessions[session.ConnectionId] = new Session(session.ConnectionId,
-                                                         session.Username,
+                                                         session.Username.ToString(),
                                                          from,
                                                          session.PublicKeyFingerprint,
                                                          since);
@@ -395,12 +395,12 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             public ValueTask<Boolean> AuthorizePublicKeyAsync(SshPublicKeyAuthRequest  Request,
                                                               CancellationToken        CancellationToken = default)
 
-                => ValueTask.FromResult(Accounts.Find(Request.Username, Request.PublicKeyBlob) is not null);
+                => ValueTask.FromResult(Accounts.Find(Request.Username.ToString(), Request.PublicKeyBlob) is not null);
 
             public ValueTask<SshSessionRestrictions> GetRestrictionsAsync(SshPublicKeyAuthRequest  Request,
                                                                           CancellationToken        CancellationToken = default)
 
-                => ValueTask.FromResult(Accounts.Find(Request.Username, Request.PublicKeyBlob)?.Restrictions
+                => ValueTask.FromResult(Accounts.Find(Request.Username.ToString(), Request.PublicKeyBlob)?.Restrictions
                                             ?? SshSessionRestrictions.None);
 
         }

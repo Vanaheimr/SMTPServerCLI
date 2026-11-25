@@ -21,6 +21,7 @@ using System.Net;
 using System.Text;
 using System.Net.Sockets;
 
+using org.GraphDefined.Vanaheimr.Illias;
 using org.GraphDefined.Vanaheimr.Hermod.SSH;
 using org.GraphDefined.Vanaheimr.Hermod.SSH.Client;
 
@@ -234,7 +235,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI.Tests
         {
 
             await using var client  = await Connect("alice", userKey, CancellationToken);
-            await using var shell   = await client.OpenShellAsync(new SshPty("xterm", new SshWindowSize(120, 30), new Dictionary<Byte, UInt32>()),
+            await using var shell   = await client.OpenShell(new SshPty("xterm", new SshWindowSize(120, 30), new Dictionary<Byte, UInt32>()),
                                                                   CancellationToken: CancellationToken);
 
             var screen = new StringBuilder();
@@ -342,16 +343,16 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI.Tests
         /// <summary>
         /// Sign in over SSH, trusting only the host key the banner names.
         /// </summary>
-        private ValueTask<SshClient> Connect(String Account, ISshHostKey Key, CancellationToken CancellationToken)
+        private ValueTask<SSHClient> Connect(String Account, ISshHostKey Key, CancellationToken CancellationToken)
 
-            => SshClient.ConnectAsync("127.0.0.1",
-                                      server.Settings.SSHPort,
-                                      new SshClientOptions {
-                                          Username       = Account,
-                                          Credentials    = [ Key ],
-                                          VerifyHostKey  = blob => server.SSH!.HostKey!.EndsWith(SshFingerprint.Sha256(blob))
-                                      },
-                                      CancellationToken);
+            => SSHClient.Connect("127.0.0.1",
+                                 IPPort.Parse(server.Settings.SSHPort),
+                                 new SSHClientOptions {
+                                     Username       = User_Id.Parse(Account),
+                                     Credentials    = [ Key ],
+                                     VerifyHostKey  = blob => server.SSH!.HostKey!.EndsWith(SshFingerprint.Sha256(blob))
+                                 },
+                                 CancellationToken);
 
         #endregion
 

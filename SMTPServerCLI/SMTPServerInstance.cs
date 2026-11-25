@@ -200,9 +200,9 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
             var smtpServerConfig = new SMTPServerConfig {
 
                 Hostname                 = Settings.Hostname,
-                Port                     = Settings.Port,
-                SubmissionPort           = Settings.SubmissionPort,
-                ImplicitTlsPort          = Settings.ImplicitTlsPort,
+                Port                     = IPPort.Parse(Settings.Port),
+                SubmissionPort           = IPPort.Parse(Settings.SubmissionPort),
+                ImplicitTlsPort          = IPPort.Parse(Settings.ImplicitTlsPort),
                 MailStoragePath          = Settings.MailStoragePath,
                 CertificatePath          = CertificatePath,
                 CertificatePassword      = Settings.CertificatePassword,
@@ -252,7 +252,7 @@ namespace org.GraphDefined.Vanaheimr.Hermod.SMTP.CLI
                 RequireStartTls    = Configuration.OutboundRequireStartTls,
                 EnableDane         = Configuration.EnableDane,
                 SmartHost          = Settings.SmartHost,
-                SmartHostPort      = Settings.SmartHostPort,
+                SmartHostPort      = IPPort.Parse(Settings.SmartHostPort),
                 SmartHostUsername  = Settings.SmartHostUsername,
                 SmartHostPassword  = Settings.SmartHostPassword
             };
